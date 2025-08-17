@@ -1,731 +1,419 @@
-# app.py
-import os
 import io
-import json
-import re
-import pandas as pd
+import math
+import textwrap
+from datetime import datetime
+
 import numpy as np
+import pandas as pd
 import streamlit as st
 import altair as alt
-from rapidfuzz import process, fuzz
 
-# -------------------------------
+# =========================
 # Config & Constants
-# -------------------------------
+# =========================
 APP_TITLE = "Profit Pulse — Phase 1 Diagnostic"
-PASSWORD_ENV = "PROFIT_PULSE_PASSWORD"
-
-# Canonical schema for transactional table
-REQUIRED_TXN = ["transaction_date", "product_id", "quantity", "unit_price", "cost", "currency"]
-OPTIONAL_TXN = ["customer_id", "channel", "discount", "rebate", "return_flag"]
-ALL_TXN = REQUIRED_TXN + OPTIONAL_TXN
-
-# Canonical subsets for other tables
-PM_FIELDS  = ["product_id", "channel"]                  # minimal product master fields we may use
-PL_FIELDS  = ["product_id", "unit_price", "currency"]   # price list
-CTS_FIELDS = ["product_id", "cost", "currency"]         # cost table
-
-AUTO_AGG_MAX_ROWS = 1_000_000
-AUTO_AGG_MAX_BYTES = 250 * 1024 * 1024  # 250 MB
+PASSWORD = "PP-PULSE"  # Keep in sync with your internal standard if needed
 
 # Traffic-light thresholds
-GM_GREEN = 0.30
-DISC_REBATE_GREEN = 0.08
-RETURNS_GREEN = 0.02
-COMPLETENESS_GREEN = 0.90
-
-PALETTE = {
-    "bg": "#0f172a",      # slate
-    "primary": "#0a4b78", # deep blue
-    "accent": "#1e88e5",  # accent blue
-    "teal": "#00a3a3",
-    "green": "#22c55e",
-    "amber": "#f59e0b",
-    "red": "#ef4444",
-    "muted": "#64748b",
+THR = {
+    "gm_green": 0.30,
+    "disc_reb_green": 0.08,
+    "returns_green": 0.02,
+    "data_green": 0.90,
 }
 
-EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-TAXID_REGEX = re.compile(r"\b\d{2,3}-?\d{2,3}-?\d{2,4}\b")
-ADDRESS_REGEX = re.compile(r"\d+\s+\w+\s+(St|Ave|Rd|Road|Street|Avenue|Boulevard|Blvd)\b", re.IGNORECASE)
+# Large file guardrails
+MAX_FILE_BYTES = 250 * 1024 * 1024  # 250 MB
+MAX_ROWS = 1_000_000
 
-# Synonyms & boolean tokens for schema mapper
-SYNONYMS = {
-    "transaction_date": ["date","doc_date","invoice_date","posting_date","txn_date","order_date"],
-    "product_id": ["sku","item_id","product","material","product_code","item_code"],
-    "quantity": ["qty","units","unit_qty","sold_qty","order_qty"],
-    "unit_price": ["price","list_price","sell_price","sales_price","unitprice"],
-    "cost": ["unit_cost","std_cost","cogs","cost_amt","cost_price"],
-    "currency": ["curr","currency_code","iso_currency","fx_currency"],
-    "customer_id": ["cust_id","customer","account_id","buyer_id","client_id"],
-    "channel": ["sales_channel","channel_name","route_to_market","rtm"],
-    "discount": ["disc","promo_discount","markdown","price_discount","allowance"],
-    "rebate": ["rebate_amt","retro_rebate","billback","credit"],
-    "return_flag": ["is_return","return","rma","returned","is_refund"]
-}
-BOOL_TRUE_DEFAULT = {"1","true","t","yes","y"}
-BOOL_FALSE_DEFAULT = {"0","false","f","no","n"}
-
-# -------------------------------
-# Utility functions
-# -------------------------------
-def human_bytes(n):
-    if n is None: return "Unknown"
-    for unit in ["B","KB","MB","GB","TB"]:
-        if n < 1024.0:
-            return f"{n:.1f} {unit}"
-        n /= 1024.0
-    return f"{n:.1f} PB"
-
-def safe_lower_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    return df
-
-def detect_pii(df: pd.DataFrame):
-    """Return list of tuples (column, issue) flagged as PII-like. Does not return raw values."""
-    flags = []
-    for col in df.columns:
-        if df[col].dtype == object:
-            series = df[col].dropna().astype(str).head(1000)
-            try:
-                if series.str.contains(EMAIL_REGEX).any():
-                    flags.append((col, "email-like pattern"))
-                if series.str.contains(TAXID_REGEX).any():
-                    flags.append((col, "tax-id-like pattern"))
-                if series.str.contains(ADDRESS_REGEX).any():
-                    flags.append((col, "address-like pattern"))
-            except Exception:
-                pass
-    return flags
-
-def load_table(file):
-    name = file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(file)
-    elif name.endswith(".parquet"):
-        return pd.read_parquet(file)
-    elif name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(file)
-    else:
-        raise ValueError("Unsupported file type. Use CSV, XLSX, or Parquet.")
-
-def completeness_score(df: pd.DataFrame, required_cols):
-    present = [c for c in required_cols if c in df.columns]
-    score = len(present) / len(required_cols) if required_cols else 1.0
-    return score, present, [c for c in required_cols if c not in present]
-
-def calc_fields(df: pd.DataFrame):
-    df = df.copy()
-    for c in ["quantity", "unit_price", "cost", "discount", "rebate"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["extended_price"] = df.get("quantity", 0) * df.get("unit_price", 0)
-    df["net_price"] = df["extended_price"] - df.get("discount", 0) - df.get("rebate", 0)
-    df["gross_margin"] = df["net_price"] - (df.get("quantity", 0) * df.get("cost", 0))
-    df["gm_pct"] = np.where(df["net_price"] != 0, df["gross_margin"] / df["net_price"], np.nan)
-    if "return_flag" in df.columns:
-        s = df["return_flag"].astype(str).str.lower().str.strip()
-        df["is_return"] = s.isin(BOOL_TRUE_DEFAULT) | s.isin({"true","t","1","yes","y"})
-    else:
-        df["is_return"] = False
-    return df
-
-def aggregate_bigdata(df: pd.DataFrame, include_customer=False):
-    df = df.copy()
-    if "transaction_date" in df.columns:
-        df["yyyymm"] = pd.to_datetime(df["transaction_date"], errors="coerce").dt.to_period("M").astype(str)
-    else:
-        df["yyyymm"] = "NA"
-    for col, default in [("discount", 0.0), ("rebate", 0.0), ("extended_price", 0.0),
-                         ("net_price", 0.0), ("gross_margin", 0.0), ("is_return", False)]:
-        if col not in df.columns:
-            df[col] = default
-    group_keys = ["product_id", "yyyymm"]
-    if include_customer and "customer_id" in df.columns:
-        group_keys.insert(0, "customer_id")
-    agg_dict = {
-        "quantity": "sum",
-        "unit_price": "mean",
-        "cost": "mean",
-        "discount": "sum",
-        "rebate": "sum",
-        "extended_price": "sum",
-        "net_price": "sum",
-        "gross_margin": "sum",
-        "is_return": "sum"
-    }
-    agg = df.groupby(group_keys, dropna=False).agg(agg_dict).reset_index()
-    agg["gm_pct"] = np.where(agg["net_price"] != 0, agg["gross_margin"]/agg["net_price"], np.nan)
-    agg["returns_pct"] = np.where(agg["quantity"] > 0, agg["is_return"]/agg["quantity"], np.nan)
-    return agg
-
-def remediation_tier(missing_cols, pii_flags, currency_missing):
-    if missing_cols or pii_flags or currency_missing:
-        issues = 0
-        if missing_cols: issues += len(missing_cols)
-        if pii_flags: issues += len(pii_flags)
-        if currency_missing: issues += 1
-        return "C" if issues >= 3 else "B"
-    return "A"
-
-# -------------------------------
-# Schema Mapping & Profiles
-# -------------------------------
-def guess_mapping(source_cols, canon_fields, threshold=80):
-    mapping = {}
-    normalized = [c.strip().lower() for c in source_cols]
-    for canon in canon_fields:
-        candidates = [canon] + SYNONYMS.get(canon, [])
-        for cand in candidates:
-            if cand in normalized:
-                mapping[canon] = source_cols[normalized.index(cand)]
-                break
-        if canon not in mapping:
-            choice = process.extractOne(canon, normalized, scorer=fuzz.WRatio)
-            if choice and choice[1] >= threshold:
-                mapping[canon] = source_cols[choice[2]]
-    return mapping
-
-def schema_mapper_ui(df, allowed_fields, saved_profile=None, key_prefix=""):
-    st.subheader(f"Schema Mapper — {key_prefix or 'table'}")
-    source_cols = list(df.columns)
-    initial_map = (saved_profile or {}).get("mapping", {}) or guess_mapping(source_cols, allowed_fields)
-
-    col_map = {}
-    grid = st.columns(2)
-    with grid[0]:
-        st.caption("Map your source columns → canonical fields")
-    with grid[1]:
-        st.caption("Select from detected source columns")
-
-    for canon in allowed_fields:
-        options = ["-- none --"] + source_cols
-        default = initial_map.get(canon, "-- none --")
-        idx = options.index(default) if default in options else 0
-        sel = st.selectbox(f"{canon}", options, index=idx, key=f"{key_prefix}_map_{canon}")
-        if sel != "-- none --":
-            col_map[canon] = sel
-
-    st.markdown("**Type & Value Hints**")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        date_fmt = st.text_input(
-            "Date format hint (optional)",
-            value=(saved_profile or {}).get("date_format", ""),
-            key=f"{key_prefix}_datefmt"
-        )
-    with c2:
-        default_currency = st.text_input(
-            "Default currency if missing",
-            value=(saved_profile or {}).get("default_currency", ""),
-            key=f"{key_prefix}_defcur"
-        )
-    with c3:
-        bool_true_vals = st.text_input(
-            "True tokens (comma)",
-            value=",".join((saved_profile or {}).get("bool_true", list(BOOL_TRUE_DEFAULT))),
-            key=f"{key_prefix}_btrue"
-        )
-    bool_false_vals = st.text_input(
-        "False tokens (comma)",
-        value=",".join((saved_profile or {}).get("bool_false", list(BOOL_FALSE_DEFAULT))),
-        key=f"{key_prefix}_bfalse"
-    )
-
-    profile = {
-        "mapping": col_map,
-        "date_format": date_fmt.strip(),
-        "default_currency": default_currency.strip(),
-        "bool_true": [v.strip().lower() for v in bool_true_vals.split(",") if v.strip()],
-        "bool_false": [v.strip().lower() for v in bool_false_vals.split(",") if v.strip()],
-    }
-    return profile
-
-def apply_profile(df, profile, allowed_fields):
-    df = df.copy()
-    out = pd.DataFrame(index=df.index)
-    mapping = profile.get("mapping", {})
-    for canon, src in mapping.items():
-        if canon in allowed_fields and src in df.columns:
-            out[canon] = df[src]
-    # Dates
-    if "transaction_date" in out.columns:
-        fmt = profile.get("date_format")
-        if fmt:
-            out["transaction_date"] = pd.to_datetime(out["transaction_date"], format=fmt, errors="coerce")
-        else:
-            out["transaction_date"] = pd.to_datetime(out["transaction_date"], errors="coerce")
-    # Numbers
-    for c in set(allowed_fields).intersection({"quantity","unit_price","cost","discount","rebate"}):
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-    # Currency
-    if "currency" in out.columns:
-        out["currency"] = out["currency"].astype(str).str.upper().str.strip()
-    else:
-        dc = profile.get("default_currency")
-        if dc:
-            out["currency"] = dc.upper()
-    # Booleans
-    if "return_flag" in out.columns:
-        tset = set(profile.get("bool_true", [])) or BOOL_TRUE_DEFAULT
-        fset = set(profile.get("bool_false", [])) or BOOL_FALSE_DEFAULT
-        s = out["return_flag"].astype(str).str.lower().str.strip()
-        out["return_flag"] = np.where(s.isin(tset), True, np.where(s.isin(fset), False, np.nan))
-    return out
-
-def validate_profile_against_pii(profile, pii_flags):
-    pii_cols = {col for col,_ in pii_flags}
-    bad = [src for src in profile.get("mapping", {}).values() if src in pii_cols]
-    if bad:
-        raise ValueError(f"Profile attempts to map PII-like columns: {', '.join(bad)}")
-
-def export_combined_profile_button(profile_txn, profile_pm, profile_pl, profile_cts, name="mapping_profile_multi"):
-    combined = {
-        "transactional": profile_txn or {},
-        "product_master": profile_pm or {},
-        "price_list": profile_pl or {},
-        "cts": profile_cts or {},
-        "meta": {
-            "version": "1.0",
-            "notes": "Multi-table mapping profile for Profit Pulse Phase 1"
-        }
-    }
-    buf = io.StringIO()
-    json.dump(combined, buf, indent=2)
-    st.download_button(
-        label="Download combined mapping profile (JSON)",
-        file_name=f"{name}.json",
-        mime="application/json",
-        data=buf.getvalue(),
-        use_container_width=True
-    )
-
-def import_profile_uploader(key="profile_upload"):
-    up = st.file_uploader("Load existing mapping profile (JSON)", type=["json"], key=key)
-    if up:
-        try:
-            return json.load(up)
-        except Exception as e:
-            st.error(f"Invalid profile: {e}")
-    return None
-
-# -------------------------------
-# Streamlit App
-# -------------------------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
+
+# Theme helpers
+COLOR = {
+    "green": "#1a9c5d",
+    "amber": "#f2a700",
+    "red": "#d13c3c",
+    "blue": "#1f4b99",
+    "slate": "#3c4758",
+    "teal": "#008b8b",
+}
+
+# =========================
+# UI: Header & About
+# =========================
 st.title(APP_TITLE)
-st.caption("Private-use diagnostic. Works only with anonymized data. No external benchmarks. Phase 1 only.")
+st.caption("Private-use diagnostic. Operates on anonymized CSV data only. No PII.")
 
+# =========================
 # Password Gate
-if "authed" not in st.session_state:
-    st.session_state.authed = False
+# =========================
+with st.sidebar:
+    st.subheader("Access")
+    pw = st.text_input("Password", type="password")
+    authed = pw == PASSWORD
+    if pw and not authed:
+        st.error("That’s not the correct password. I can’t proceed.")
 
-stored_pw = os.getenv(PASSWORD_ENV, "")
-inp = st.text_input("Enter password to proceed", type="password")
+if not authed:
+    st.stop()
 
-if not st.session_state.authed:
-    if inp:
-        if stored_pw and inp == stored_pw:
-            st.session_state.authed = True
-        else:
-            st.error("That’s not the correct password. I can’t proceed.")
-            st.stop()
-    else:
-        st.stop()
-
-# Once authed
-st.success("Authenticated. Proceed with Phase 1 intake.")
-
-st.header("Choose Diagnostic Mode")
-mode = st.radio(
-    "Mode",
-    ["Quick Diagnostic (transactional only)", "Full Diagnostic (all available files)"],
-    index=0
+# =========================
+# Mode Selection & Guidance
+# =========================
+st.sidebar.subheader("Diagnostic Mode")
+mode = st.sidebar.radio(
+    "Choose scope",
+    ["Quick (Transactional only)", "Full (Transactional + optional masters)"],
+    index=0,
 )
 
-with st.expander("Expected Columns & Rules", expanded=False):
-    st.markdown("""
-- **Required (transactional)**: `transaction_date`, `product_id`, `quantity`, `unit_price`, `cost`, `currency`  
-- **Optional (transactional)**: `customer_id`, `channel`, `discount`, `rebate`, `return_flag`  
-- **Masters (optional)**:  
-  - Product Master: `product_id`, (optional) `channel`  
-  - Price List: `product_id`, `unit_price`, `currency`  
-  - CTS/Costs: `product_id`, `cost`, `currency`  
-- **Auto-aggregation** if transactional > **1,000,000 rows** or **250 MB**.  
-- **No PII**: PII-like columns are flagged and blocked from mapping.
-""")
+st.markdown(
+    """
+**Expected CSV columns (anonymized IDs only):**
 
-st.header("Upload Files")
-st.caption("Provide anonymized files only.")
+**Required (Quick):**
+- `date` (YYYY-MM-DD)
+- `product_id`
+- `quantity` (numeric)
+- `unit_price` (numeric)
+- `unit_cost` (numeric)
 
-txn_file = st.file_uploader("Transactional file (CSV, XLSX, or Parquet)", type=["csv","xlsx","xls","parquet"], key="txn")
-pm_file = None
-pl_file = None
-cts_file = None
+**Optional (improves accuracy):**
+- `customer_id`
+- `discount` (per line, absolute)
+- `rebate` (per line, absolute)
+- `currency` (e.g., USD/EUR) — currency math is **flagged** unless clarified
+- `returns_qty`, `returns_amount`
 
+> Upload CSVs only to keep installs light. If your file is huge, we’ll auto-aggregate by `product_id × month` (and `customer_id × month` if present).
+"""
+)
+
+# =========================
+# File Uploaders
+# =========================
+st.subheader("Upload Data")
+txn = st.file_uploader("Transactional CSV (required)", type=["csv"], key="txn")
+price = None
+cts = None
 if mode.startswith("Full"):
-    cols = st.columns(3)
-    with cols[0]:
-        pm_file = st.file_uploader("Product master (optional)", type=["csv","xlsx","xls","parquet"], key="pm")
-    with cols[1]:
-        pl_file = st.file_uploader("Price list (optional)", type=["csv","xlsx","xls","parquet"], key="pl")
-    with cols[2]:
-        cts_file = st.file_uploader("CTS / Costs (optional)", type=["csv","xlsx","xls","parquet"], key="cts")
+    price = st.file_uploader("Optional: Price/Master CSV", type=["csv"], key="price")
+    cts = st.file_uploader("Optional: Cost-to-Serve CSV", type=["csv"], key="cts")
 
-period = st.select_slider("Rolling Period", options=["3 months","6 months","12 months","Full dataset"], value="12 months")
+period = st.radio("Rolling period", ["3 months", "6 months", "12 months", "Full dataset"], index=2)
 
-if st.button("Run Diagnostic", type="primary", use_container_width=True):
-    if not txn_file:
-        st.error("Transactional file is required.")
-        st.stop()
+# =========================
+# Utility Functions
+# =========================
+def parse_period_filter(df, col="date"):
+    if period == "Full dataset":
+        return df
+    months = int(period.split()[0])
+    max_date = pd.to_datetime(df[col], errors="coerce").max()
+    if pd.isna(max_date):
+        return df
+    cutoff = (max_date.to_period("M") - (months - 1)).to_timestamp()
+    return df[df[col] >= cutoff]
 
-    # ---------- Load all uploaded tables ----------
-    def try_load(file):
-        if not file: return None
-        try:
-            return safe_lower_cols(load_table(file))
-        except Exception as e:
-            st.error(f"Could not read file {file.name}: {e}")
-            st.stop()
-
-    src_txn = try_load(txn_file)
-    src_pm  = try_load(pm_file)
-    src_pl  = try_load(pl_file)
-    src_cts = try_load(cts_file)
-
-    # file size note
-    file_bytes = getattr(txn_file, "size", None)
-    st.info(f"Transactional file size: {human_bytes(file_bytes)}")
-
-    # ---------- PII detection per table ----------
-    pii_txn = detect_pii(src_txn)
-    pii_pm  = detect_pii(src_pm)  if src_pm  is not None else []
-    pii_pl  = detect_pii(src_pl)  if src_pl  is not None else []
-    pii_cts = detect_pii(src_cts) if src_cts is not None else []
-
-    # ---------- Profile load ----------
-    st.subheader("Profiles")
-    loaded_profile = import_profile_uploader()
-    if loaded_profile:
-        st.success("Loaded multi-table mapping profile.")
-
-    # ---------- Mapping UIs ----------
-    st.info("Map your columns to canonical fields. Save the combined profile to reuse later.")
-
-    txn_profile = schema_mapper_ui(
-        src_txn,
-        allowed_fields=ALL_TXN,
-        saved_profile=(loaded_profile or {}).get("transactional", {}),
-        key_prefix="txn"
-    )
-    try:
-        validate_profile_against_pii(txn_profile, pii_txn)
-    except ValueError as e:
-        st.error(str(e)); st.stop()
-    df_txn = apply_profile(src_txn, txn_profile, allowed_fields=ALL_TXN)
-    st.markdown("**Transactional — canonicalized preview**")
-    st.dataframe(df_txn.head(10))
-
-    df_pm = None; pm_profile = None
-    if src_pm is not None:
-        pm_profile = schema_mapper_ui(
-            src_pm,
-            allowed_fields=PM_FIELDS,
-            saved_profile=(loaded_profile or {}).get("product_master", {}),
-            key_prefix="pm"
-        )
-        try:
-            validate_profile_against_pii(pm_profile, pii_pm)
-        except ValueError as e:
-            st.error(str(e)); st.stop()
-        df_pm = apply_profile(src_pm, pm_profile, allowed_fields=PM_FIELDS)
-        st.markdown("**Product Master — canonicalized preview**")
-        st.dataframe(df_pm.head(10))
-
-    df_pl = None; pl_profile = None
-    if src_pl is not None:
-        pl_profile = schema_mapper_ui(
-            src_pl,
-            allowed_fields=PL_FIELDS,
-            saved_profile=(loaded_profile or {}).get("price_list", {}),
-            key_prefix="pl"
-        )
-        try:
-            validate_profile_against_pii(pl_profile, pii_pl)
-        except ValueError as e:
-            st.error(str(e)); st.stop()
-        df_pl = apply_profile(src_pl, pl_profile, allowed_fields=PL_FIELDS)
-        st.markdown("**Price List — canonicalized preview**")
-        st.dataframe(df_pl.head(10))
-
-    df_cts = None; cts_profile = None
-    if src_cts is not None:
-        cts_profile = schema_mapper_ui(
-            src_cts,
-            allowed_fields=CTS_FIELDS,
-            saved_profile=(loaded_profile or {}).get("cts", {}),
-            key_prefix="cts"
-        )
-        try:
-            validate_profile_against_pii(cts_profile, pii_cts)
-        except ValueError as e:
-            st.error(str(e)); st.stop()
-        df_cts = apply_profile(src_cts, cts_profile, allowed_fields=CTS_FIELDS)
-        st.markdown("**CTS / Costs — canonicalized preview**")
-        st.dataframe(df_cts.head(10))
-
-    # ---------- Export combined profile ----------
-    pname = st.text_input("Combined profile name (for download)", value="client_profile_multi")
-    export_combined_profile_button(txn_profile, pm_profile, pl_profile, cts_profile, name=pname)
-
-    # ---------- Enrichment from masters BEFORE completeness ----------
-    # Fill unit_price from price_list where missing
-    if df_pl is not None and "product_id" in df_pl.columns:
-        # Join on product_id; prefer transactional currency if present
-        jcols = ["product_id"]
-        enrich = df_pl[["product_id"] + [c for c in ["unit_price","currency"] if c in df_pl.columns]].copy()
-        df_txn = df_txn.merge(enrich, on=jcols, how="left", suffixes=("", "_pl"))
-        if "unit_price" not in df_txn.columns and "unit_price_pl" in df_txn.columns:
-            df_txn["unit_price"] = df_txn["unit_price_pl"]
-        elif "unit_price_pl" in df_txn.columns:
-            df_txn["unit_price"] = df_txn["unit_price"].fillna(df_txn["unit_price_pl"])
-        if "currency" not in df_txn.columns and "currency_pl" in df_txn.columns:
-            df_txn["currency"] = df_txn["currency_pl"]
-        df_txn.drop(columns=[c for c in ["unit_price_pl","currency_pl"] if c in df_txn.columns], inplace=True)
-
-    # Fill cost from CTS where missing
-    if df_cts is not None and "product_id" in df_cts.columns:
-        enrich = df_cts[["product_id"] + [c for c in ["cost","currency"] if c in df_cts.columns]].copy()
-        df_txn = df_txn.merge(enrich, on=["product_id"], how="left", suffixes=("", "_cts"))
-        if "cost" not in df_txn.columns and "cost_cts" in df_txn.columns:
-            df_txn["cost"] = df_txn["cost_cts"]
-        elif "cost_cts" in df_txn.columns:
-            df_txn["cost"] = df_txn["cost"].fillna(df_txn["cost_cts"])
-        df_txn.drop(columns=[c for c in ["cost_cts","currency_cts"] if c in df_txn.columns], inplace=True)
-
-    # Fill channel from Product Master if missing in txn
-    if df_pm is not None and "product_id" in df_pm.columns and "channel" in df_pm.columns:
-        df_txn = df_txn.merge(df_pm[["product_id","channel"]], on="product_id", how="left", suffixes=("", "_pm"))
-        if "channel" not in df_txn.columns and "channel_pm" in df_txn.columns:
-            df_txn["channel"] = df_txn["channel_pm"]
-        elif "channel_pm" in df_txn.columns:
-            df_txn["channel"] = df_txn["channel"].fillna(df_txn["channel_pm"])
-        if "channel_pm" in df_txn.columns:
-            df_txn.drop(columns=["channel_pm"], inplace=True)
-
-    # ---------- Completeness check (after enrichment) ----------
-    score, present, missing = completeness_score(df_txn, REQUIRED_TXN)
-
-    # KPI header tiles (initial completeness + PII flags + placeholder for agg decision)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Required Columns Present", f"{len(present)}/{len(REQUIRED_TXN)}")
-    c2.metric("Data Completeness", f"{score*100:.0f}%")
-    total_pii = len(pii_txn) + len(pii_pm) + len(pii_pl) + len(pii_cts)
-    c3.metric("PII Flags (any table)", str(total_pii))
-    c4.metric("Auto-Aggregation?", "Pending")
-
-    if missing:
-        st.warning("Running **limited-scope** diagnostic due to missing required transactional columns.")
-        st.header("Data Remediation Plan")
-        tier = remediation_tier(missing, pii_txn, currency_missing=("currency" not in present))
-        st.write(f"**Tier:** {tier}")
-        st.write("**Issues & Impact**")
-        st.markdown("- Missing required (transactional): " + ", ".join(missing))
-        for table_name, flags in [("product_master", pii_pm), ("price_list", pii_pl), ("cts", pii_cts)]:
-            if flags:
-                st.markdown(f"- PII-like patterns detected in **{table_name}**: " + ", ".join({c for c,_ in flags}))
-        st.markdown("""
-**Impact**: Limits accuracy of GM%, discount/rebate %, returns %, and time-based aggregation.  
-**Next Steps**: Provide the missing required fields in the transactional file; keep all IDs anonymized; remove/omit PII columns in any table.
-""")
-        st.stop()
-
-    # ---------- ETL & Derived fields ----------
-    before_rows = len(df_txn)
-    df_txn = df_txn.drop_duplicates()
-    deduped = before_rows - len(df_txn)
-    df_txn = calc_fields(df_txn)
-
-    # ---------- Rolling period filter ----------
-    period_choice = period
-    if period_choice != "Full dataset" and "transaction_date" in df_txn.columns:
-        months = int(period_choice.split()[0])
-        max_date = pd.to_datetime(df_txn["transaction_date"], errors="coerce").max()
-        if pd.isna(max_date):
-            st.warning("Invalid or missing dates; using full dataset.")
+def traffic(value, green_thresh, reverse=False):
+    """
+    Returns (label, color) where green >= thresh (or <= if reverse=True).
+    """
+    if pd.isna(value):
+        return ("N/A", COLOR["amber"])
+    if reverse:
+        if value <= green_thresh:
+            return ("Good", COLOR["green"])
+        elif value <= green_thresh * 1.5:
+            return ("Watch", COLOR["amber"])
         else:
-            min_cut = (max_date - pd.DateOffset(months=months-1)).normalize()
-            df_txn = df_txn[pd.to_datetime(df_txn["transaction_date"], errors="coerce") >= min_cut]
+            return ("Risk", COLOR["red"])
+    else:
+        if value >= green_thresh:
+            return ("Good", COLOR["green"])
+        elif value >= green_thresh * 0.7:
+            return ("Watch", COLOR["amber"])
+        else:
+            return ("Risk", COLOR["red"])
 
-    # ---------- Auto-aggregation ----------
-    need_agg = False
-    file_bytes = getattr(txn_file, "size", None)
-    if file_bytes is not None and file_bytes > AUTO_AGG_MAX_BYTES:
-        need_agg = True
-    if len(df_txn) > AUTO_AGG_MAX_ROWS:
-        need_agg = True
-    c4.metric("Auto-Aggregation?", "Yes" if need_agg else "No")
-    if need_agg:
-        st.info("Dataset is large. Aggregating by product_id × month (and customer_id if present).")
-        df_txn = aggregate_bigdata(df_txn, include_customer=("customer_id" in df_txn.columns))
+def read_csv_safely(file, required_cols, sample_rows=10_000):
+    """
+    Try to read quickly. If file is very large or rows exceed threshold,
+    return (df_or_agg, used_agg_mode: bool)
+    """
+    if file.size and file.size > MAX_FILE_BYTES:
+        return aggregate_in_chunks(file, required_cols), True
 
-    # ---------- Metrics ----------
-    total_ext = df_txn["extended_price"].sum(skipna=True) if "extended_price" in df_txn.columns else 0.0
-    total_net = df_txn["net_price"].sum(skipna=True) if "net_price" in df_txn.columns else 0.0
-    total_gm  = df_txn["gross_margin"].sum(skipna=True) if "gross_margin" in df_txn.columns else 0.0
-    gm_pct = (total_gm / total_net) if total_net else np.nan
-    disc = df_txn["discount"].sum(skipna=True) if "discount" in df_txn.columns else 0.0
-    reb  = df_txn["rebate"].sum(skipna=True) if "rebate" in df_txn.columns else 0.0
-    disc_rebate_pct = ((disc + reb) / (total_ext + 1e-9)) if total_ext else 0.0
-    qty_sum = df_txn["quantity"].sum(skipna=True) if "quantity" in df_txn.columns else 0.0
-    returns_pct = (df_txn["is_return"].sum(skipna=True) / (qty_sum + 1e-9)) if "is_return" in df_txn.columns else 0.0
+    file.seek(0)
+    sample = pd.read_csv(file, nrows=sample_rows, low_memory=False)
 
-    # ---------- Dashboard ----------
-    st.header("Dashboard Readout")
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("GM%", f"{gm_pct*100:.1f}%" if pd.notna(gm_pct) else "NA", help="Gross Margin / Net Price")
-    k2.metric("Discount+Rebate %", f"{disc_rebate_pct*100:.1f}%")
-    k3.metric("Returns %", f"{returns_pct*100:.1f}%")
-    k4.metric("Data Completeness", f"{score*100:.0f}%")
-    k5.metric("Deduplicated Rows", f"{deduped}")
+    total_rows_estimate = None
+    if file.size:
+        avg_row_size = max(1, int(file.size / max(1, len(sample))))
+        total_rows_estimate = int(file.size / avg_row_size)
 
-    st.caption(
-        f"GM% {'🟢' if (pd.notna(gm_pct) and gm_pct >= GM_GREEN) else '🔴'}  •  "
-        f"Disc+Rebate {'🟢' if disc_rebate_pct <= DISC_REBATE_GREEN else '🔴'}  •  "
-        f"Returns {'🟢' if returns_pct <= RETURNS_GREEN else '🔴'}  •  "
-        f"Completeness {'🟢' if score >= COMPLETENESS_GREEN else '🟠'}"
-    )
+    if total_rows_estimate and total_rows_estimate > MAX_ROWS:
+        file.seek(0)
+        return aggregate_in_chunks(file, required_cols), True
 
-    # Visuals
-    st.subheader("Price-Volume-Mix Bridge (Net → Cost → GM)")
-    cost_total = (df_txn.get("quantity", 0) * df_txn.get("cost", 0)).sum() if "cost" in df_txn.columns and "quantity" in df_txn.columns else 0.0
-    wdf = pd.DataFrame({
-        "Component": ["Net Price", "Cost", "Gross Margin"],
-        "Value": [total_net, -cost_total, total_gm],
-        "Color": ["#1e88e5", "#ef4444", "#22c55e"]
-    })
-    chart = alt.Chart(wdf).mark_bar().encode(
-        x=alt.X("Component:N"),
-        y=alt.Y("Value:Q"),
-        color=alt.Color("Color:N", scale=None)
-    ).properties(width=600, height=300)
-    st.altair_chart(chart, use_container_width=True)
-    st.write("- Net → GM bridge shows cost contribution to margin.")
-    st.write("- Extend to full PVM decomposition in later phases.")
+    file.seek(0)
+    df = pd.read_csv(file, low_memory=False)
+    return df, False
 
-    st.subheader("GM% by Product (Top 25 by Net)")
-    if {"product_id","net_price","gross_margin"}.issubset(df_txn.columns):
-        by_prod = df_txn.groupby("product_id", dropna=False).agg(
-            net=("net_price","sum"),
-            gm=("gross_margin","sum")
+def aggregate_in_chunks(file, required_cols):
+    file.seek(0)
+    chunks = pd.read_csv(file, chunksize=200_000, low_memory=False)
+    agg = None
+
+    for ch in chunks:
+        ch_cols = {c.lower().strip(): c for c in ch.columns}
+        ch.rename(columns={v: k for k, v in ch_cols.items()}, inplace=True)
+
+        for col in ["date", "quantity", "unit_price", "unit_cost"]:
+            if col not in ch.columns:
+                ch[col] = np.nan
+
+        ch["date"] = pd.to_datetime(ch.get("date"), errors="coerce")
+        ch["month"] = ch["date"].dt.to_period("M").dt.to_timestamp()
+        ch["discount"] = pd.to_numeric(ch.get("discount", 0), errors="coerce").fillna(0.0)
+        ch["rebate"] = pd.to_numeric(ch.get("rebate", 0), errors="coerce").fillna(0.0)
+        ch["quantity"] = pd.to_numeric(ch.get("quantity"), errors="coerce").fillna(0.0)
+        ch["unit_price"] = pd.to_numeric(ch.get("unit_price"), errors="coerce").fillna(0.0)
+        ch["unit_cost"] = pd.to_numeric(ch.get("unit_cost"), errors="coerce").fillna(0.0)
+
+        ch["extended_price"] = ch["quantity"] * ch["unit_price"] - ch["discount"] - ch["rebate"]
+        ch["cogs"] = ch["quantity"] * ch["unit_cost"]
+        ch["gross_margin"] = ch["extended_price"] - ch["cogs"]
+
+        group_keys = ["product_id", "month"]
+        if "customer_id" in ch.columns:
+            group_keys = ["customer_id"] + group_keys
+
+        g = ch.groupby(group_keys, dropna=False).agg(
+            quantity=("quantity", "sum"),
+            revenue=("extended_price", "sum"),
+            cogs=("cogs", "sum"),
+            discount=("discount", "sum"),
+            rebate=("rebate", "sum"),
+            txn_rows=("unit_price", "count"),
         ).reset_index()
-        by_prod["gm_pct"] = np.where(by_prod["net"] != 0, by_prod["gm"]/by_prod["net"], np.nan)
-        top = by_prod.sort_values("net", ascending=False).head(25)
-        chart2 = alt.Chart(top).mark_bar().encode(
-            x=alt.X("product_id:N", sort="-y"),
-            y=alt.Y("gm_pct:Q", axis=alt.Axis(format="%")),
-            color=alt.value(PALETTE["teal"]),
-            tooltip=["product_id","net","gm","gm_pct"]
-        ).properties(height=350)
-        st.altair_chart(chart2, use_container_width=True)
-        st.write("- Target SKUs with high net but sub-30% GM for pricing/cost actions.")
-    else:
-        st.info("Insufficient fields to render GM% by product.")
 
-    st.subheader("Discount+Rebate % by Month")
-    if "transaction_date" in df_txn.columns and df_txn["transaction_date"].notna().any():
-        m = df_txn.copy()
-        m["yyyymm"] = pd.to_datetime(m["transaction_date"], errors="coerce").dt.to_period("M").astype(str)
-        ext_sum = m.groupby("yyyymm")["extended_price"].sum() if "extended_price" in m.columns else pd.Series(dtype=float)
-        disc_sum = m.groupby("yyyymm")["discount"].sum() if "discount" in m.columns else pd.Series(0.0, index=ext_sum.index)
-        reb_sum  = m.groupby("yyyymm")["rebate"].sum() if "rebate" in m.columns else pd.Series(0.0, index=ext_sum.index)
-        m_disc = pd.DataFrame({"ext": ext_sum}).join(disc_sum.rename("disc"), how="left").join(reb_sum.rename("reb"), how="left").fillna(0.0)
-        m_disc["dr_pct"] = (m_disc["disc"] + m_disc["reb"]) / (m_disc["ext"] + 1e-9)
-        m_disc = m_disc.reset_index(names=["yyyymm"])
-        chart3 = alt.Chart(m_disc).mark_line(point=True).encode(
-            x=alt.X("yyyymm:N", title="Month"),
-            y=alt.Y("dr_pct:Q", axis=alt.Axis(format="%")),
-            color=alt.value(PALETTE["accent"])
-        ).properties(height=300)
-        st.altair_chart(chart3, use_container_width=True)
-        st.write("- Watch for spikes >8% and investigate promo/leakage.")
-    else:
-        st.info("No valid transaction dates to chart monthly discount/rebate %.")
+        g["gross_margin"] = g["revenue"] - g["cogs"]
+        g["gm_pct"] = np.where(g["revenue"] != 0, g["gross_margin"] / g["revenue"], np.nan)
 
-    # ---------- Data Remediation Plan ----------
-    st.header("Data Remediation Plan")
-    currency_missing = ("currency" not in df_txn.columns) or (df_txn["currency"].isna().all() if "currency" in df_txn.columns else True)
-    tier = remediation_tier([], pii_txn, currency_missing)
-    st.write(f"**Tier:** {tier}")
-    checklist = []
-    if total_pii:
-        checklist.append("Remove columns with PII-like patterns in any table before next run.")
-    if currency_missing:
-        checklist.append("Provide transaction currency or confirm single-currency scope.")
-    if "return_flag" not in df_txn.columns:
-        checklist.append("Provide a returns indicator to quantify returns % accurately.")
-    if "discount" not in df_txn.columns or "rebate" not in df_txn.columns:
-        checklist.append("Add discount and rebate fields to separate price effects.")
-    if "customer_id" not in df_txn.columns:
-        checklist.append("Add anonymized customer_id to enable cohort analysis.")
-    if deduped > 0:
-        checklist.append("Investigate source-system causes of duplicate lines.")
-    if checklist:
-        st.markdown("- " + "\n- ".join(checklist))
-    else:
-        st.write("No major data gaps detected for Phase 1.")
+        agg = g if agg is None else pd.concat([agg, g], ignore_index=True)
 
-    # ---------- Briefing Deck ----------
-    st.header("Briefing Deck (Summary)")
-    gm_text = f"{gm_pct*100:.1f}%" if pd.notna(gm_pct) else "NA"
-    st.markdown(f"""
-- **GM%**: {gm_text} ({'≥30% OK' if (pd.notna(gm_pct) and gm_pct >= GM_GREEN) else '<30% — improvement needed'}).  
-- **Discount+Rebate %**: {disc_rebate_pct*100:.1f}% ({'≤8% OK' if disc_rebate_pct <= DISC_REBATE_GREEN else '>8% — potential leakage'}).  
-- **Returns %**: {returns_pct*100:.1f}% ({'≤2% OK' if returns_pct <= RETURNS_GREEN else '>2% — quality/fulfillment issue?'}).  
-- **Data completeness**: {score*100:.0f}%.
-""")
+    if agg is not None:
+        by = [c for c in ["customer_id", "product_id", "month"] if c in agg.columns]
+        agg = agg.groupby(by, dropna=False, as_index=False).sum(numeric_only=True)
+        agg["gross_margin"] = agg["revenue"] - agg["cogs"]
+        agg["gm_pct"] = np.where(agg["revenue"] != 0, agg["gross_margin"] / agg["revenue"], np.nan)
 
-    st.subheader("Opportunities & Risks")
-    st.markdown("""
-**Opportunities**  
-1) Tighten discount/rebate controls to hit ≤8%.  
-2) Improve product mix toward higher GM% SKUs.  
-3) Validate unit costs & currency normalization (consider masters as source of truth).
+    return agg if agg is not None else pd.DataFrame()
 
-**Risks**  
-1) PII contamination in any table.  
-2) Returns underreported without `return_flag`.  
-3) Overaggregation can mask outliers in large datasets.
-""")
+def normalize_and_derive(df):
+    cols = {c.lower().strip(): c for c in df.columns}
+    df = df.rename(columns={v: k for k, v in cols.items()})
 
-    st.subheader("Questions for First Client Call")
-    st.markdown("""
-1) What currency(s) are present, and is FX normalization required?  
-2) Which discount/rebate mechanisms drive the largest % swings?  
-3) Any supply or logistics issues inflating returns?  
-4) Do we have customer/channel identifiers for segmentation?  
-5) Any upcoming price/cost changes to reflect?
-""")
+    df["date"] = pd.to_datetime(df.get("date"), errors="coerce")
+    for num in ["quantity", "unit_price", "unit_cost", "discount", "rebate", "returns_qty", "returns_amount"]:
+        if num in df.columns:
+            df[num] = pd.to_numeric(df[num], errors="coerce")
 
-    st.subheader("Assumptions & Formulas")
-    st.markdown("""
-- **extended_price** = quantity × unit_price  
-- **net_price** = extended_price − discount − rebate  
-- **gross_margin** = net_price − (quantity × cost)  
-- **GM%** = gross_margin ÷ net_price  
-- **Returns %** = returns_lines ÷ quantity (approx. without explicit RMA qty)  
-Results marked as **indicative** where inputs are weak or missing.
-""")
+    df["discount"] = df.get("discount", 0).fillna(0.0)
+    df["rebate"] = df.get("rebate", 0).fillna(0.0)
+    if "returns_qty" in df.columns:
+        df["returns_qty"] = df["returns_qty"].fillna(0.0)
+    if "returns_amount" in df.columns:
+        df["returns_amount"] = df["returns_amount"].fillna(0.0)
 
-    # PII notice (columns only)
-    if total_pii:
-        pills = []
-        if pii_txn: pills.append("transactional: " + ", ".join({c for c,_ in pii_txn}))
-        if pii_pm:  pills.append("product_master: " + ", ".join({c for c,_ in pii_pm}))
-        if pii_pl:  pills.append("price_list: " + ", ".join({c for c,_ in pii_pl}))
-        if pii_cts: pills.append("cts: " + ", ".join({c for c,_ in pii_cts}))
-        st.error("PII-like patterns detected (columns only) → " + " | ".join(pills) + ". Remove before next run.")
+    df["extended_price"] = df["quantity"] * df["unit_price"] - df["discount"] - df["rebate"]
+    df["cogs"] = df["quantity"] * df["unit_cost"]
+    df["gross_margin"] = df["extended_price"] - df["cogs"]
+    df["gm_pct"] = np.where(df["extended_price"] != 0, df["gross_margin"] / df["extended_price"], np.nan)
+    df["month"] = df["date"].dt.to_period("M").dt.to_timestamp()
 
-st.caption("Note: Phase 1 avoids external benchmarks. Names are never displayed unless explicitly allowed.")
+    return df
+
+def data_completeness_score(df):
+    required = ["date", "product_id", "quantity", "unit_price", "unit_cost"]
+    available = df[required]
+    completeness = 1.0 - (available.isna().sum().sum() / available.size)
+    return max(0.0, min(1.0, completeness))
+
+def remediation_tier(missing_flags):
+    score = 0
+    for k, v in missing_flags.items():
+        score += 2 if v else 0
+    if score >= 6:
+        return "C"
+    if score >= 3:
+        return "B"
+    return "A"
+
+def render_kpis(summary):
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Revenue", f"${summary['revenue']:,.0f}")
+    c2.metric("Gross Margin", f"${summary['gross_margin']:,.0f}")
+    gm_label, gm_color = traffic(summary["gm_pct"], THR["gm_green"])
+    c3.markdown(f"<div style='color:{gm_color};font-weight:600'>GM%: {summary['gm_pct']:.1%} · {gm_label}</div>", unsafe_allow_html=True)
+
+    disc_reb = summary.get("disc_reb_pct")
+    lbl, col = traffic(disc_reb, THR["disc_reb_green"], reverse=True)
+    c4.markdown(f"<div style='color:{col};font-weight:600'>Discount+Rebate: {disc_reb:.1%} · {lbl}</div>", unsafe_allow_html=True)
+
+# =========================
+# Processing
+# =========================
+if txn is None:
+    st.info("Upload transactional CSV to begin.")
+    st.stop()
+
+required_cols = ["date", "product_id", "quantity", "unit_price", "unit_cost"]
+
+with st.spinner("Reading data..."):
+    df, aggregated = read_csv_safely(txn, required_cols)
+
+if df.empty:
+    st.error("The uploaded file appears to be empty or unreadable.")
+    st.stop()
+
+if aggregated:
+    st.warning("Large file detected. Switched to aggregation mode (by month × product, and customer if present).")
+
+with st.spinner("Normalizing & deriving metrics..."):
+    df = normalize_and_derive(df)
+    df = parse_period_filter(df)
+
+# =========================
+# Validation & Remediation
+# =========================
+missing_flags = {
+    "date_missing": df["date"].isna().any(),
+    "product_id_missing": "product_id" not in df.columns or df["product_id"].isna().any(),
+    "qty_missing": df["quantity"].isna().any(),
+    "price_missing": df["unit_price"].isna().any(),
+    "cost_missing": df["unit_cost"].isna().any(),
+    "currency_unhandled": "currency" in df.columns,
+}
+tier = remediation_tier(missing_flags)
+data_score = data_completeness_score(df)
+
+st.subheader("Data Remediation Plan")
+st.write(f"**Tier {tier}** — data completeness: **{data_score:.0%}**")
+issues = []
+if missing_flags["date_missing"]: issues.append("Some `date` values are missing or invalid.")
+if missing_flags["product_id_missing"]: issues.append("`product_id` missing or contains nulls.")
+if missing_flags["qty_missing"]: issues.append("Some `quantity` values are missing/invalid.")
+if missing_flags["price_missing"]: issues.append("Some `unit_price` values are missing/invalid.")
+if missing_flags["cost_missing"]: issues.append("Some `unit_cost` values are missing/invalid.")
+if missing_flags["currency_unhandled"]: issues.append("`currency` present — multi-currency not normalized (flagged).")
+
+if issues:
+    st.error("• " + "\n• ".join(issues))
+else:
+    st.success("No critical structural issues detected in required fields.")
+
+st.caption("Next steps: supply missing fields; confirm currency handling; provide returns/discount/rebate detail if available.")
+
+# =========================
+# Dashboard Readout
+# =========================
+st.subheader("Dashboard")
+
+summary = {}
+summary["revenue"] = float(df["extended_price"].sum())
+summary["cogs"] = float(df["cogs"].sum())
+summary["gross_margin"] = summary["revenue"] - summary["cogs"]
+summary["gm_pct"] = (summary["gross_margin"] / summary["revenue"]) if summary["revenue"] else np.nan
+disc_reb_total = float(df["discount"].sum() + df["rebate"].sum())
+summary["disc_reb_pct"] = (disc_reb_total / (summary["revenue"] + disc_reb_total)) if (summary["revenue"] + disc_reb_total) else np.nan
+render_kpis(summary)
+
+st.markdown("**Traffic-light checks**")
+checks = pd.DataFrame([
+    {"Metric": "GM%", "Value": f"{summary['gm_pct']:.1%}" if not pd.isna(summary["gm_pct"]) else "N/A", "Status": traffic(summary["gm_pct"], THR["gm_green"])[0]},
+    {"Metric": "Discount+Rebate %", "Value": f"{summary['disc_reb_pct']:.1%}" if not pd.isna(summary["disc_reb_pct"]) else "N/A", "Status": traffic(summary["disc_reb_pct"], THR["disc_reb_green"], reverse=True)[0]},
+    {"Metric": "Returns %", "Value": "N/A" if "returns_amount" not in df.columns else (f\"{(df['returns_amount'].sum() / summary['revenue']):.1%}\" if summary[\"revenue\"] else \"N/A\"), "Status": "N/A" if "returns_amount" not in df.columns else traffic((df[\"returns_amount\"].sum() / summary[\"revenue\"]) if summary[\"revenue\"] else np.nan, THR[\"returns_green\"], reverse=True)[0]},
+    {"Metric": "Data completeness", "Value": f"{data_score:.0%}", "Status": traffic(data_score, THR["data_green"])[0]},
+])
+st.dataframe(checks, use_container_width=True)
+
+st.markdown("**GM% by Month**")
+gm_by_m = df.groupby("month", as_index=False).agg(revenue=("extended_price", "sum"), cogs=("cogs", "sum"))
+gm_by_m["gm_pct"] = np.where(gm_by_m["revenue"] != 0, (gm_by_m["revenue"] - gm_by_m["cogs"]) / gm_by_m["revenue"], np.nan)
+
+chart = alt.Chart(gm_by_m).mark_line(point=True, color=COLOR["blue"]).encode(
+    x=alt.X("month:T", title="Month"),
+    y=alt.Y("gm_pct:Q", title="GM%", axis=alt.Axis(format="%")),
+    tooltip=["month", alt.Tooltip("gm_pct:Q", format=".1%"), alt.Tooltip("revenue:Q", format="$.2s")]
+).properties(height=280)
+st.altair_chart(chart, use_container_width=True)
+
+st.markdown("**Top/Bottom Products by GM%**")
+if "product_id" in df.columns:
+    prod = df.groupby("product_id", as_index=False).agg(revenue=("extended_price", "sum"), cogs=("cogs", "sum"))
+    prod["gm_pct"] = np.where(prod["revenue"] != 0, (prod["revenue"] - prod["cogs"]) / prod["revenue"], np.nan)
+    top5 = prod.sort_values("gm_pct", ascending=False).head(5)
+    bot5 = prod.sort_values("gm_pct", ascending=True).head(5)
+    c1, c2 = st.columns(2)
+    c1.write("**Top 5**"); c1.dataframe(top5, use_container_width=True)
+    c2.write("**Bottom 5**"); c2.dataframe(bot5, use_container_width=True)
+
+st.subheader("Briefing Deck (Summary)")
+bullets = [
+    f"GM% over selected period: {summary['gm_pct']:.1%}" if not pd.isna(summary['gm_pct']) else "GM% not computable.",
+    f"Discount+Rebate load: {summary['disc_reb_pct']:.1%}" if not pd.isna(summary['disc_reb_pct']) else "Discount/Rebate % not available.",
+    f"Data completeness: {data_score:.0%} (Tier {tier}).",
+    "Large-file aggregation was applied." if aggregated else "Full-grain data used.",
+]
+st.write("• " + "\n• ".join(bullets))
+
+st.subheader("Opportunities & Risks")
+opp = []
+risk = []
+if not pd.isna(summary["disc_reb_pct"]) and summary["disc_reb_pct"] > THR["disc_reb_green"]:
+    opp.append("Tighten discount/rebate policies; target ≤ 8% of pre-discount revenue.")
+if not pd.isna(summary["gm_pct"]) and summary["gm_pct"] < THR["gm_green"]:
+    opp.append("Review pricing and cost-to-serve on low-GM% products; consider price floors.")
+if "returns_amount" in df.columns and summary["revenue"]:
+    ret_pct = df["returns_amount"].sum() / summary["revenue"]
+    if ret_pct > THR["returns_green"]:
+        opp.append("Reduce returns via quality/fit improvements; audit high-return SKUs.")
+if data_score < THR["data_green"]:
+    risk.append("Data gaps may distort margin metrics; prioritize remediation before decisions.")
+if missing_flags["currency_unhandled"]:
+    risk.append("Multi-currency present without normalization; GM% may be skewed.")
+
+st.write("**Top 3–5 Levers**")
+st.write("• " + "\n• ".join(opp[:5]) if opp else "No obvious levers beyond standard hygiene.")
+st.write("**Key Risks**")
+st.write("• " + "\n• ".join(risk[:5]) if risk else "No major risks detected.")
+
+st.subheader("Questions for First Client Call")
+qs = [
+    "How are discounts and rebates recorded (per-line vs. end-of-period)?",
+    "Any multi-currency transactions? If so, what FX policy should be applied?",
+    "Are returns netted in revenue or recorded separately?",
+    "Any non-product revenue or freight in unit_price/unit_cost?",
+    "Do we have cost-to-serve or fulfillment cost drivers for Phase 2?",
+]
+st.write("• " + "\n• ".join(qs))
+
+st.subheader("Assumptions & Formulas")
+st.markdown(
+    """
+**Assumptions**
+- Anonymized IDs only; PII excluded.
+- Currency not normalized unless explicitly stated.
+- Returns excluded unless provided as `returns_amount` or `returns_qty`.
+- Aggregation mode uses `product_id × month` (and `customer_id` if present).
+
+**Formulas**
+- `extended_price = quantity * unit_price − discount − rebate`
+- `cogs = quantity * unit_cost`
+- `gross_margin = extended_price − cogs`
+- `gm% = gross_margin / extended_price`
+- `discount+rebate % = (discount + rebate) / (extended_price + discount + rebate)`
+"""
+)
