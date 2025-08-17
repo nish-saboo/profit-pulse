@@ -1,24 +1,35 @@
+
 import io
+import json
 import math
+import zipfile
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 from dateutil.relativedelta import relativedelta
+from difflib import get_close_matches
 
 APP_PW = "PP-PULSE"
-
-# ---------- UI ----------
 st.set_page_config(page_title="Profit Pulse", layout="wide")
 st.title("📈 Profit Pulse — Private Price & Profitability Diagnostic")
 
-# ---------- Password Gate ----------
+# ---------------- Password Gate ----------------
 pw = st.text_input("Enter password to begin", type="password", help="Phase 1 password required.")
 if pw != APP_PW:
     st.info("Please enter the correct password to proceed.")
     st.stop()
 
-# ---------- Uploads ----------
+with st.expander("About column 'synonyms' (detector)", expanded=False):
+    st.write("""
+**Synonyms** are alternate header names we recognize for each target field.  
+Example: for **invoice_id**, we also try: `invoice`, `invoice_no`, `invoice_number`, `doc_id`, `order_id`, `so_number`, etc.  
+If your exports use different labels, saving a **Mapping Profile** (below) trains the app to auto-map your headers next time—no code changes.
+""")
+
+# ---------------- Uploads ----------------
 st.subheader("Upload Files")
 c1, c2 = st.columns(2)
 with c1:
@@ -34,10 +45,17 @@ with c4:
 with c5:
     cts_file = st.file_uploader("Cost-to-Serve map (optional)", type=["csv", "xlsx"])
 
-# Rolling window selector
 window = st.radio("Time window", ["3 months", "6 months", "12 months (default)", "Full dataset"], index=2, horizontal=True)
 
-# ---------- Helpers ----------
+# ---------------- Mapping Profile (load) ----------------
+st.subheader("Mapping Profiles")
+mp_col1, mp_col2 = st.columns([2,1])
+with mp_col1:
+    mapping_profile_upload = st.file_uploader("Load a Mapping Profile (JSON)", type=["json"], key="mpu")
+with mp_col2:
+    st.caption("Tip: Save a profile after your first run; reuse it for future uploads from the same system.")
+
+# ---------------- Helpers ----------------
 def read_any(upload):
     if upload is None:
         return None
@@ -45,12 +63,86 @@ def read_any(upload):
         return pd.read_excel(upload)
     return pd.read_csv(upload)
 
+def normalize_colname(c):
+    return (
+        str(c).strip().lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+        .replace("/", "_")
+        .replace(".", "_")
+    )
+
+SYNONYMS = {
+    "invoice_id": {"invoice_id","invoice","invoice_no","invoice_number","inv_id","doc_id","document_id","order_id","so_number","so_id","txn_id"},
+    "invoice_date": {"invoice_date","date","invoice_dt","order_date","posting_date","txn_date","document_date"},
+    "customer_id": {"customer_id","customer","customer_code","client_id","account","account_id","bill_to_id","buyer_id","ship_to_id"},
+    "product_id": {"product_id","sku","item","item_id","material","part_number","product","product_code"},
+    "quantity": {"quantity","qty","units","unit_qty","qty_sold","ordered_qty"},
+    "net_price": {"net_price","unit_price","price","sell_price","sell_prc","realized_price","net_unit_price"},
+    "extended_price": {"extended_price","line_total","line_amount","amount","revenue","sales_amount","net_amount","ext_price","gross_sales"},
+    "standard_cost": {"standard_cost","unit_cost","cost","cogs_unit","cogs_per_unit"},
+    "variable_cost": {"variable_cost","var_cost","vcost_unit"},
+    "discount_amount": {"discount_amount","discount","disc_amt","promo_discount","line_discount"},
+    "rebate_amount": {"rebate_amount","rebate","rbt_amt"},
+    "freight_cost": {"freight_cost","freight","shipping_cost","logistics_cost","delivery_cost"},
+    "returns_flag": {"returns_flag","return","is_return","returns","rma_flag","credit_flag","negative_sale"},
+    "currency": {"currency","curr","fx","currency_code","iso_currency"},
+    "uom": {"uom","unit","unit_of_measure","measure_unit"},
+}
+
+TARGETS_REQUIRED = ["invoice_id","invoice_date","customer_id","product_id","quantity"]
+TARGETS_OPTIONAL = ["net_price","extended_price","standard_cost","variable_cost","discount_amount","rebate_amount","freight_cost","returns_flag","currency","uom"]
+
+def auto_map_columns(df_cols):
+    cols_norm = {normalize_colname(c): c for c in df_cols}
+    result = {}
+    # synonym match
+    for tgt, syns in SYNONYMS.items():
+        match = None
+        for n, orig in cols_norm.items():
+            if n in syns:
+                match = orig
+                break
+        if match is None:
+            # fuzzy fallback
+            candidates = list(cols_norm.keys())
+            guess = get_close_matches(tgt, candidates, n=1, cutoff=0.82)
+            if guess:
+                match = cols_norm[guess[0]]
+        result[tgt] = match
+    return result
+
+def apply_mapping(df, mapping):
+    rename_dict = {src: tgt for tgt, src in mapping.items() if src}
+    df2 = df.rename(columns=rename_dict).copy()
+
+    # Synthesize IDs if missing but name-like fields exist
+    norm_cols = {normalize_colname(c): c for c in df.columns}
+    if "customer_id" not in df2.columns:
+        for alt in ["customer","customer_name","account","buyer","bill_to_name"]:
+            if alt in norm_cols:
+                orig = norm_cols[alt]
+                codes = df[orig].astype("category").cat.codes + 1
+                df2["customer_id"] = codes.map(lambda x: f"CUST{x}")
+                break
+    if "product_id" not in df2.columns:
+        for alt in ["product","product_name","sku","item","material"]:
+            if alt in norm_cols:
+                orig = norm_cols[alt]
+                codes = df[orig].astype("category").cat.codes + 1
+                df2["product_id"] = codes.map(lambda x: f"PROD{x}")
+                break
+
+    # Derive extended_price if missing
+    if "extended_price" not in df2.columns and {"quantity","net_price"}.issubset(df2.columns):
+        df2["extended_price"] = pd.to_numeric(df2["quantity"], errors="coerce") * pd.to_numeric(df2["net_price"], errors="coerce")
+
+    return df2
+
 def parse_date(series):
-    # Try best-effort parse
     return pd.to_datetime(series, errors="coerce", utc=False).dt.tz_localize(None)
 
 def traffic_light(metric, value):
-    # Defaults from spec; returns emoji + band
     if metric == "GM%":
         if value >= 0.30: return "🟢", "≥30%"
         if value >= 0.20: return "🟡", "20–30%"
@@ -76,305 +168,258 @@ def traffic_light(metric, value):
 def size_mb(upload):
     return (upload.size / 1_048_576.0) if upload is not None else 0.0
 
-def month_floor(dt):
-    return pd.Timestamp(year=dt.year, month=dt.month, day=1)
-
-def summarize_pct(numer, denom):
-    if denom == 0 or pd.isna(denom): return np.nan
-    return numer / denom
-
-def detect_mixed_currency(df):
-    # Heuristic: presence of 'currency' column OR money-like symbols in price columns
-    money_cols = [c for c in df.columns if c.lower() in ("net_price","extended_price","standard_cost","variable_cost","discount_amount","rebate_amount","freight_cost")]
-    symbol_found = False
-    for c in money_cols:
-        if df[c].dtype == object:
-            sample = df[c].astype(str).head(200).str.contains(r"[$€£]|[,]", regex=True, na=False).any()
-            symbol_found = symbol_found or sample
-    has_currency_col = any(c.lower()=="currency" for c in df.columns)
-    return (symbol_found and not has_currency_col), has_currency_col
-
-def safe_number(x):
-    try:
-        return float(x)
-    except Exception:
-        return np.nan
-
-def kpi_tile(label, value, band_text, emoji):
-    st.metric(label=label, value=value, delta=f"{emoji} {band_text}")
-
-def coalesce(*vals):
-    for v in vals:
-        if v is not None:
-            return v
-    return None
-
-# ---------- Run Diagnostic ----------
+# ---------------- Run ----------------
 if st.button("Run diagnostic", type="primary", use_container_width=True):
     if trx_file is None:
         st.error("Transactional file is required.")
         st.stop()
 
-    trx = read_any(trx_file)
-    cust = read_any(cust_file)
-    prod = read_any(prod_file)
-    price = read_any(price_file)
-    cts = read_any(cts_file)
+    trx_raw = read_any(trx_file)
 
-    # -------- Data size guardrail --------
-    ROW_CAP, MB_CAP = 1_000_000, 250
-    oversized = (len(trx) > ROW_CAP) or (size_mb(trx_file) > MB_CAP)
+    # Optional: load mapping profile JSON
+    loaded_profile = None
+    if mapping_profile_upload is not None:
+        try:
+            loaded_profile = json.load(mapping_profile_upload)
+            st.success(f"Loaded mapping profile: {loaded_profile.get('profile_name','(unnamed)')}")
+        except Exception as e:
+            st.warning(f"Could not read mapping profile JSON: {e}")
 
-    # -------- ETL & Validation --------
+    st.markdown("### 🔎 Column mapping")
+    st.caption("We detected likely matches. Confirm or change each field; choose **(not present)** if the data doesn't exist.")
+
+    # Build mapping UI
+    candidate = auto_map_columns(trx_raw.columns)
+
+    # If a mapping profile exists, prefer it (only if the column exists in this file)
+    if loaded_profile and "mapping" in loaded_profile:
+        for tgt, src in loaded_profile["mapping"].items():
+            if src and src in trx_raw.columns:
+                candidate[tgt] = src
+
+    ui_mapping = {}
+    all_options = ["(not present)"] + list(trx_raw.columns)
+
+    cols_required = st.columns(len(TARGETS_REQUIRED))
+    for i, tgt in enumerate(TARGETS_REQUIRED):
+        with cols_required[i]:
+            default = candidate.get(tgt) if candidate.get(tgt) in all_options else "(not present)"
+            ui_mapping[tgt] = st.selectbox(f"Required: {tgt}", all_options, index=all_options.index(default) if default in all_options else 0)
+
+    cols_optional = st.columns(min(5, len(TARGETS_OPTIONAL)))
+    for i, tgt in enumerate(TARGETS_OPTIONAL):
+        if i % 5 == 0 and i != 0:
+            cols_optional = st.columns(5)
+        with cols_optional[i % 5]:
+            default = candidate.get(tgt) if candidate.get(tgt) in all_options else "(not present)"
+            ui_mapping[tgt] = st.selectbox(f"Optional: {tgt}", all_options, index=all_options.index(default) if default in all_options else 0)
+
+    # Save Mapping Profile (download JSON)
+    st.markdown("#### 💾 Save this mapping as a profile")
+    prof_col1, prof_col2 = st.columns([2,1])
+    with prof_col1:
+        profile_name = st.text_input("Profile name (e.g., 'Acme NetSuite Export')", value="My Mapping Profile")
+    with prof_col2:
+        mp = {
+            "profile_name": profile_name,
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "mapping": {k:(None if v=='(not present)' else v) for k,v in ui_mapping.items()}
+        }
+        mp_bytes = json.dumps(mp, indent=2).encode("utf-8")
+        st.download_button("Download Mapping Profile (.json)", mp_bytes, file_name=f"{profile_name.replace(' ','_').lower()}_mapping.json", use_container_width=True)
+
+    # Apply mapping
+    mapping = {k:(None if v=="(not present)" else v) for k, v in ui_mapping.items()}
+    trx = apply_mapping(trx_raw, mapping)
+
+    # Validate minimum required
+    missing_after = [c for c in TARGETS_REQUIRED if c not in trx.columns]
+    if missing_after:
+        st.error("Missing required fields after mapping: " + ", ".join(missing_after))
+        st.write("Minimal headers needed: invoice_id, invoice_date, customer_id, product_id, quantity.")
+        st.stop()
+
+    # Continue ETL
     etl_issues = []
 
-    # Column presence
-    required_keys = ["invoice_id","invoice_date","customer_id","product_id","quantity"]
-    missing_required = [c for c in required_keys if c not in trx.columns]
-    if missing_required:
-        etl_issues.append(f"Transactional: missing required columns {missing_required}")
-
-    # Date parse
-    if "invoice_date" in trx.columns:
-        trx["invoice_date"] = parse_date(trx["invoice_date"])
-        if trx["invoice_date"].isna().mean() > 0.05:
-            etl_issues.append(">5% invoice_date not parseable")
+    # Parse dates
+    trx["invoice_date"] = pd.to_datetime(trx["invoice_date"], errors="coerce", utc=False).dt.tz_localize(None)
+    if trx["invoice_date"].isna().mean() > 0.05:
+        etl_issues.append(">5% invoice_date not parseable")
 
     # Numeric coercions
     for col in ["quantity","net_price","extended_price","standard_cost","variable_cost","discount_amount","rebate_amount","freight_cost"]:
         if col in trx.columns:
             trx[col] = pd.to_numeric(trx[col], errors="coerce")
 
-    # Derive extended_price if missing
-    if "extended_price" not in trx.columns and "net_price" in trx.columns and "quantity" in trx.columns:
-        trx["extended_price"] = trx["quantity"] * trx["net_price"]
-
-    # Derive cost/unit
-    cost_col = None
-    if "standard_cost" in trx.columns: cost_col = "standard_cost"
-    elif "variable_cost" in trx.columns: cost_col = "variable_cost"
-
-    # Deduplicate invoice lines (simple heuristic)
+    # Dedupe (safe)
+    subset_cols = [c for c in ["invoice_id","product_id","invoice_date","customer_id"] if c in trx.columns]
     before = len(trx)
-    trx = trx.drop_duplicates(subset=[c for c in ["invoice_id","product_id","invoice_date","customer_id"] if c in trx.columns], keep="first")
+    if subset_cols:
+        trx = trx.drop_duplicates(subset=subset_cols, keep="first")
     dedup_rate = (before - len(trx)) / before if before else 0.0
 
-    # Orphans after joining
-    orphan_customer = orphan_product = np.nan
-    if cust is not None and "customer_id" in trx.columns and "customer_id" in cust.columns:
-        orphan_customer = 1 - (trx["customer_id"].isin(cust["customer_id"]).mean())
-
-    if prod is not None and "product_id" in trx.columns and "product_id" in prod.columns:
-        orphan_product = 1 - (trx["product_id"].isin(prod["product_id"]).mean())
-
-    # Returns detection (negative qty or returns_flag == 1)
-    returns_mask = pd.Series(False, index=trx.index)
-    if "quantity" in trx.columns:
-        returns_mask |= trx["quantity"] < 0
-    if "returns_flag" in trx.columns:
-        returns_mask |= trx["returns_flag"].fillna(0).astype(int) == 1
-
-    # Mixed currency detection
-    mixed_currency_signals, has_currency_col = detect_mixed_currency(trx)
-    if mixed_currency_signals and not has_currency_col:
-        etl_issues.append("Potential mixed-currency data without a currency column (Tier C). Please add 'currency' or upload FX rates.")
+    # Oversize aggregation
+    ROW_CAP, MB_CAP = 1_000_000, 250
+    oversized = (len(trx) > ROW_CAP) or (trx_file is not None and getattr(trx_file, "size", 0) / 1_048_576.0 > MB_CAP)
+    aggregated = False
+    if oversized:
+        st.warning("Large transactional file detected. Auto-aggregating to month × product_id (and customer_id if present).")
+        trx["_ym"] = trx["invoice_date"].dt.to_period("M").astype(str)
+        group_cols = ["_ym","product_id"] + (["customer_id"] if "customer_id" in trx.columns else [])
+        agg_cols = {c:"sum" for c in ["quantity","extended_price","discount_amount","rebate_amount","freight_cost"] if c in trx.columns}
+        cost_col = "standard_cost" if "standard_cost" in trx.columns else ("variable_cost" if "variable_cost" in trx.columns else None)
+        if cost_col: agg_cols[cost_col] = "sum"
+        trx = trx.groupby(group_cols, dropna=False).agg(agg_cols).reset_index()
+        aggregated = True
 
     # Rolling window filter
-    if "invoice_date" in trx.columns and trx["invoice_date"].notna().any() and window != "Full dataset":
+    if trx["invoice_date"].notna().any() and window != "Full dataset":
         end_date = trx["invoice_date"].max()
         months = {"3 months":3, "6 months":6, "12 months (default)":12}[window]
         start_date = end_date - relativedelta(months=months) + pd.offsets.MonthBegin(0)
         trx = trx[trx["invoice_date"].between(start_date, end_date)]
 
-    # Auto-aggregate for over-size
-    aggregated = False
-    if oversized:
-        st.warning("Large transactional file detected. Auto-aggregating to month × product_id (and customer_id if present).")
-        if "invoice_date" in trx.columns:
-            trx["_ym"] = trx["invoice_date"].dt.to_period("M").astype(str)
-        else:
-            trx["_ym"] = "Unknown"
-        group_cols = ["_ym","product_id"]
-        if "customer_id" in trx.columns: group_cols.append("customer_id")
-        agg_cols = {c:"sum" for c in ["quantity","extended_price","discount_amount","rebate_amount","freight_cost"] if c in trx.columns}
-        if cost_col: agg_cols[cost_col] = "sum"
-        trx = trx.groupby(group_cols, dropna=False).agg(agg_cols).reset_index()
-        aggregated = True
+    # KPIs
+    cost_col = "standard_cost" if "standard_cost" in trx.columns else ("variable_cost" if "variable_cost" in trx.columns else None)
+    revenue = trx["extended_price"].sum() if "extended_price" in trx.columns else np.nan
+    cogs = (trx[cost_col] * trx["quantity"]).sum() if (cost_col in trx.columns and "quantity" in trx.columns) else np.nan
+    gm = revenue - cogs if (not pd.isna(revenue) and not pd.isna(cogs)) else np.nan
+    gm_pct = gm / revenue if (revenue and not pd.isna(gm)) else np.nan
 
-    # Data completeness (keys present for required cols)
+    disc_pct = ((trx.get("discount_amount", pd.Series([0])).sum() + trx.get("rebate_amount", pd.Series([0])).sum()) / revenue) if revenue else np.nan
+    returns_mask = pd.Series(False, index=trx.index)
+    if "quantity" in trx.columns:
+        returns_mask |= trx["quantity"] < 0
+    if "returns_flag" in trx.columns:
+        returns_mask |= trx["returns_flag"].fillna(0).astype(int) == 1
+    returns_rev = trx.loc[returns_mask, "extended_price"].sum() if ("extended_price" in trx.columns) else 0.0
+    returns_pct = (abs(returns_rev) / abs(revenue)) if revenue else np.nan
+    freight_cost = trx.get("freight_cost", pd.Series([0])).sum()
+    freight_recovery = (0.0 / freight_cost) if freight_cost else np.nan  # proxy if no freight revenue
+
+    # Completeness estimate
     present_mask = pd.Series(True, index=trx.index)
     for key in ["invoice_id","invoice_date","customer_id","product_id"]:
         if key in trx.columns:
             present_mask &= trx[key].notna()
     data_completeness = present_mask.mean() if len(trx) else 0.0
 
-    # GM calc (row-level if possible)
-    revenue = trx["extended_price"].sum() if "extended_price" in trx.columns else np.nan
-    cogs = (trx[cost_col] * trx["quantity"]).sum() if (cost_col in trx.columns and "quantity" in trx.columns) else np.nan
-    gm = revenue - cogs if (not pd.isna(revenue) and not pd.isna(cogs)) else np.nan
-    gm_pct = gm / revenue if (revenue and not pd.isna(gm)) else np.nan
-
-    disc_pct = summarize_pct(trx.get("discount_amount", pd.Series([0])).sum() + trx.get("rebate_amount", pd.Series([0])).sum(), revenue)
-    returns_rev = trx.loc[returns_mask, "extended_price"].sum() if ("extended_price" in trx.columns) else 0.0
-    returns_pct = summarize_pct(abs(returns_rev), abs(revenue)) if revenue else np.nan
-    freight_cost = trx.get("freight_cost", pd.Series([0])).sum()
-    freight_recovery = summarize_pct(0.0, freight_cost) if freight_cost else np.nan  # proxy
-
-    # Tiering
     tier = "Tier A (ready)"
-    if data_completeness < 0.90 or mixed_currency_signals:
+    if data_completeness < 0.90:
         tier = "Tier C (triage)"
     elif data_completeness < 0.99 or len(etl_issues) > 0:
         tier = "Tier B (fixable)"
 
-    # ---------- 1) ETL & Validation ----------
+    # ---------------- Outputs ----------------
     with st.expander("1) ETL & Validation Results", expanded=True):
         st.write({
-            "Rows": len(trx),
-            "File size (MB)": round(size_mb(trx_file), 2),
+            "Rows": int(len(trx)),
             "Deduped lines removed %": f"{dedup_rate:.2%}",
-            "Orphan customer_id %": None if math.isnan(orphan_customer) else f"{orphan_customer:.2%}",
-            "Orphan product_id %": None if math.isnan(orphan_product) else f"{orphan_product:.2%}",
             "Derived extended_price": "Yes" if "extended_price" in trx.columns else "No",
             "Aggregated on ingest": aggregated,
         })
-        if etl_issues:
+        if len(etl_issues) > 0:
             st.warning("ETL Notes:")
             for i in etl_issues:
                 st.write("• " + i)
         st.markdown(f"**Data Quality:** {tier}")
 
-    # ---------- 2) Remediation Plan (always) ----------
     remediation = []
     if cost_col is None:
         remediation.append("Transactional: missing cost field → cannot compute GM% precisely. (High)")
-    if math.isnan(orphan_customer) or orphan_customer > 0.0:
-        remediation.append("Customer master join incomplete → segmentation views limited. (Medium)")
-    if math.isnan(orphan_product) or orphan_product > 0.0:
-        remediation.append("Product master join incomplete → product family/category views limited. (Medium)")
-    if mixed_currency_signals and not has_currency_col:
-        remediation.append("Potential mixed currencies without 'currency' column → add currency or FX rates. (High)")
     if data_completeness < 0.90:
         remediation.append("Key presence below 90% → provide missing keys to unlock full diagnostic. (High)")
     if not remediation:
         remediation.append("No critical gaps detected. (Info)")
-    with st.expander("2) Data Remediation Plan (ranked checklist)", expanded=True):
-        for r in remediation:
-            st.write("• " + r)
 
-    # ---------- 3) Dashboard KPIs ----------
     st.subheader("3) Dashboard Readout")
-    kpis = []
-    # GM%
-    emoji, band = traffic_light("GM%", gm_pct if not pd.isna(gm_pct) else -1)
-    kpis.append(("Gross Margin %", f"{gm_pct:.1%}" if not pd.isna(gm_pct) else "n/a", f"{emoji} {band}"))
-    # Disc+Rebate
-    emoji, band = traffic_light("Disc+Rebate % of Rev", disc_pct if not pd.isna(disc_pct) else 0.0)
-    kpis.append(("Discount+Rebate % of Rev", f"{disc_pct:.1%}" if not pd.isna(disc_pct) else "n/a", f"{emoji} {band}"))
-    # Freight Recovery
-    emoji, band = traffic_light("Freight Recovery %", freight_recovery if not pd.isna(freight_recovery) else 0.0)
-    kpis.append(("Freight Recovery %", f"{freight_recovery:.1%}" if not pd.isna(freight_recovery) else "n/a", f"{emoji} {band}"))
-    # Returns %
-    emoji, band = traffic_light("Returns %", returns_pct if not pd.isna(returns_pct) else 0.0)
-    kpis.append(("Returns %", f"{returns_pct:.1%}" if not pd.isna(returns_pct) else "n/a", f"{emoji} {band}"))
-    # Data completeness
-    emoji, band = traffic_light("Data Completeness", data_completeness)
-    kpis.append(("Data Completeness", f"{data_completeness:.1%}", f"{emoji} {band}"))
+    def add_kpi_row(name, val):
+        emoji, band = ("⚪","") if pd.isna(val) else (("🟢","≥30%") if (name=="Gross Margin %" and val>=0.30) else ("🟡","") )
+        # We will use the shared traffic_light for consistent bands
+        from math import isnan
+        metric = "Disc+Rebate % of Rev" if name=="Discount+Rebate % of Rev" else name
+        em, band = traffic_light(metric, 0.0 if pd.isna(val) else val)
+        val_fmt = f"{val:.1%}" if not pd.isna(val) else "n/a"
+        return [name, val_fmt, f"{em} {band}"]
+    kpi_rows = [
+        add_kpi_row("Gross Margin %", gm_pct),
+        add_kpi_row("Discount+Rebate % of Rev", disc_pct),
+        add_kpi_row("Freight Recovery %", freight_recovery),
+        add_kpi_row("Returns %", returns_pct),
+        add_kpi_row("Data Completeness", data_completeness),
+    ]
+    kpis_df = pd.DataFrame(kpi_rows, columns=["Metric","Value","Status / Threshold"])
+    st.dataframe(kpis_df, use_container_width=True)
 
-    st.dataframe(pd.DataFrame(kpis, columns=["Metric", "Value", "Status / Threshold"]), use_container_width=True)
-
-    # ---------- 4) Briefing Deck Highlights ----------
     st.subheader("4) Briefing Deck — Highlights & Questions")
     colA, colB = st.columns(2)
-
-    # Price-Volume-Mix (very simple proxy)
     with colA:
         st.markdown("**Price–Volume–Mix (indicative)**")
         if "invoice_date" in trx.columns and "quantity" in trx.columns and "extended_price" in trx.columns:
-            ym = trx["invoice_date"].dt.to_period("M").astype(str) if "invoice_date" in trx.columns else "Unknown"
+            ym = trx["invoice_date"].dt.to_period("M").astype(str)
             tmp = pd.DataFrame({"ym": ym, "units": trx["quantity"], "rev": trx["extended_price"]})
             pv = tmp.groupby("ym", as_index=False).sum()
-            fig = px.line(pv, x="ym", y=["rev","units"], markers=True)
+            fig = px.line(pv, x="ym", y=["rev","units"], markers=True, title="Revenue & Units by Month")
             st.plotly_chart(fig, use_container_width=True)
-        st.write("- Revenue trend and units shown by month (indicative).")
-        st.write("- Use to spot seasonality and mix-driven shifts.")
+        st.write("- Trend lines help spot seasonality and potential mix shifts.")
         st.write("- Price effect approximated via rev/unit over time.")
         st.write("- Validate anomalies against promotions/returns.")
-        st.write("- If multi-currency, confirm FX before interpretation.")
         st.markdown("**Questions:**")
-        st.write("- Any policy changes that explain price dips?")
+        st.write("- Any policy changes that explain observed dips?")
         st.write("- Seasonality vs. share loss—what’s expected?")
 
-    # Segmentation pulse (by product family if product master exists)
     with colB:
         st.markdown("**Segmentation Pulse**")
-        if prod is not None and "product_id" in trx.columns and "product_id" in prod.columns and "family" in prod.columns and "extended_price" in trx.columns:
-            fam_map = prod[["product_id","family"]].drop_duplicates()
-            tmp = trx.merge(fam_map, on="product_id", how="left")
-            by_fam = tmp.groupby("family", dropna=False)["extended_price"].sum().reset_index()
-            fig2 = px.bar(by_fam, x="family", y="extended_price", title="Revenue by Product Family")
+        if "product_id" in trx.columns and "extended_price" in trx.columns:
+            by_prod = trx.groupby("product_id", dropna=False)["extended_price"].sum().reset_index()
+            fig2 = px.bar(by_prod, x="product_id", y="extended_price", title="Revenue by Product")
             st.plotly_chart(fig2, use_container_width=True)
-            st.write("- Families with outsized revenue may hide low margins.")
-            st.write("- Check discount concentration within top families.")
-            st.write("- Consider lifecycle (if available) for context.")
-            st.markdown("**Questions:**")
-            st.write("- Are floors differentiated by family/tier?")
-            st.write("- Which families face most competitive pressure?")
+            st.write("- Concentration in a few products can hide margin issues.")
         else:
-            st.info("Upload a Product master with `product_id` + `family` to unlock family-level segmentation.")
+            st.info("Provide `product_id` and `extended_price` for product revenue view.")
 
-    # ---------- 5) Opportunities, Risks, Questions ----------
     st.subheader("5) Opportunities & Risks")
     opps = []
-    if not pd.isna(disc_pct):
-        opps.append(f"Reduce discount+rebate % from {disc_pct:.1%} toward ≤8%.")
-    if not pd.isna(freight_recovery):
-        opps.append("Improve freight recovery toward ≥80%.")
-    if tier != "Tier A (ready)":
-        opps.append("Close data quality gaps to Tier A to unlock deeper cuts.")
-    if not opps:
-        opps.append("Maintain price discipline; monitor outliers and returns.")
-    for i, o in enumerate(opps, 1):
-        st.write(f"{i}) {o}")
+    if not pd.isna(disc_pct): opps.append(f"Reduce discount+rebate % from {disc_pct:.1%} toward ≤8%.")
+    if not pd.isna(freight_recovery): opps.append("Improve freight recovery toward ≥80%.")
+    if tier != "Tier A (ready)": opps.append("Close data quality gaps to Tier A to unlock deeper cuts.")
+    if not opps: opps.append("Maintain price discipline; monitor outliers and returns.")
+    for i, o in enumerate(opps, 1): st.write(f"{i}) {o}")
 
-    st.subheader("6) Questions for First Client Call")
-    st.write("- Is freight under-recovery policy-driven or execution-driven?")
-    st.write("- Are rebates targeted to growth or broadly applied?")
-    st.write("- How are floors differentiated by segment/tier?")
+    # ---------------- Save Project (bundle) ----------------
+    st.subheader("Save / Load Project")
+    st.caption("A project includes your mapping profile and key results. No raw transactional rows are included by default.")
 
-    st.subheader("7) Assumptions & Formulas")
-    st.code(
-        "Gross Margin $ = extended_price – (cost * quantity)\\n"
-        "Gross Margin % = Gross Margin $ / extended_price\\n"
-        "Freight recovery = freight revenue / freight cost  (freight revenue not provided → shown as n/a)\\n"
-        "Results may be indicative if inputs are incomplete."
-    )
+    # Build project JSON
+    project = {
+        "project_name": st.text_input("Project name", value="My Profit Pulse Project"),
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "window": window,
+        "tier": tier,
+        "kpis": {r["Metric"]: r["Value"] for _, r in kpis_df.iterrows()},
+        "remediation": remediation,
+        "mapping_profile": mp,  # from above
+        "notes": "No raw data included for privacy."
+    }
 
-    # ---------- 6) Export XLSX bundle ----------
-    st.subheader("Download")
+    # Prepare ZIP in-memory
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
-        # ETL sheet
-        etl_df = pd.DataFrame([
-            ["Rows", len(trx)],
-            ["Deduped lines removed %", f"{dedup_rate:.2%}"],
-            ["Orphan customer_id %", None if math.isnan(orphan_customer) else f"{orphan_customer:.2%}"],
-            ["Orphan product_id %", None if math.isnan(orphan_product) else f"{orphan_product:.2%}"],
-            ["Aggregated on ingest", aggregated],
-            ["Data Quality", tier],
-        ], columns=["Metric","Value"])
-        etl_df.to_excel(xw, sheet_name="ETL", index=False)
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("project.json", json.dumps(project, indent=2))
+        z.writestr("mapping.json", json.dumps(mp, indent=2))
+        z.writestr("kpis.csv", kpis_df.to_csv(index=False))
 
-        # Remediation
-        pd.DataFrame({"Remediation": remediation}).to_excel(xw, sheet_name="Remediation", index=False)
+    st.download_button("💾 Download Project Bundle (.zip)", buf.getvalue(), file_name=f"{project['project_name'].replace(' ','_').lower()}_project.zip", use_container_width=True)
 
-        # KPI
-        pd.DataFrame(kpis, columns=["Metric","Value","Status/Threshold"]).to_excel(xw, sheet_name="KPI", index=False)
-
-    st.download_button(
-        "Download diagnostic bundle (XLSX)",
-        data=buf.getvalue(),
-        file_name="profit_pulse_diagnostic.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True
-    )
+    # -------- Load Project (optional) --------
+    proj_upload = st.file_uploader("Load a Project Bundle (.zip)", type=["zip"], key="proj_zip")
+    if proj_upload is not None:
+        try:
+            with zipfile.ZipFile(proj_upload) as z:
+                with z.open("project.json") as pj:
+                    pj_data = json.loads(pj.read().decode("utf-8"))
+                st.success(f"Loaded project: {pj_data.get('project_name','(unnamed)')} — Tier: {pj_data.get('tier')} — Window: {pj_data.get('window')}")
+                st.json(pj_data.get("kpis", {}))
+        except Exception as e:
+            st.error(f"Could not read project zip: {e}")
