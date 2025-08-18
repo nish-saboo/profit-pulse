@@ -475,9 +475,9 @@ if missing_reqs:
             # Now rename selected sources to required names
             df.rename(columns={src: req for req, src in col_map.items()}, inplace=True)
             try:
-    st.rerun()
-except AttributeError:
-    st.experimental_rerun()
+                st.rerun()
+            except AttributeError:
+                st.experimental_rerun()
 
 
 # Re-check requireds
