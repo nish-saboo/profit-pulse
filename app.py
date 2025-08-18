@@ -332,12 +332,37 @@ render_kpis(summary)
 
 st.markdown("**Traffic-light checks**")
 checks = pd.DataFrame([
-    {"Metric": "GM%", "Value": f"{summary['gm_pct']:.1%}" if not pd.isna(summary["gm_pct"]) else "N/A", "Status": traffic(summary["gm_pct"], THR["gm_green"])[0]},
-    {"Metric": "Discount+Rebate %", "Value": f"{summary['disc_reb_pct']:.1%}" if not pd.isna(summary["disc_reb_pct"]) else "N/A", "Status": traffic(summary["disc_reb_pct"], THR["disc_reb_green"], reverse=True)[0]},
-    {"Metric": "Returns %", "Value": "N/A" if "returns_amount" not in df.columns else (f\"{(df['returns_amount'].sum() / summary['revenue']):.1%}\" if summary[\"revenue\"] else \"N/A\"), "Status": "N/A" if "returns_amount" not in df.columns else traffic((df[\"returns_amount\"].sum() / summary[\"revenue\"]) if summary[\"revenue\"] else np.nan, THR[\"returns_green\"], reverse=True)[0]},
-    {"Metric": "Data completeness", "Value": f"{data_score:.0%}", "Status": traffic(data_score, THR["data_green"])[0]},
+    {
+        "Metric": "GM%",
+        "Value": f"{summary['gm_pct']:.1%}" if not pd.isna(summary["gm_pct"]) else "N/A",
+        "Status": traffic(summary["gm_pct"], THR["gm_green"])[0],
+    },
+    {
+        "Metric": "Discount+Rebate %",
+        "Value": f"{summary['disc_reb_pct']:.1%}" if not pd.isna(summary["disc_reb_pct"]) else "N/A",
+        "Status": traffic(summary["disc_reb_pct"], THR["disc_reb_green"], reverse=True)[0],
+    },
+    {
+        "Metric": "Returns %",
+        "Value": (
+            f"{(df['returns_amount'].sum() / summary['revenue']):.1%}"
+            if "returns_amount" in df.columns and summary["revenue"]
+            else "N/A"
+        ),
+        "Status": (
+            traffic((df["returns_amount"].sum() / summary["revenue"]), THR["returns_green"], reverse=True)[0]
+            if "returns_amount" in df.columns and summary["revenue"]
+            else "N/A"
+        ),
+    },
+    {
+        "Metric": "Data completeness",
+        "Value": f"{data_score:.0%}",
+        "Status": traffic(data_score, THR["data_green"])[0],
+    },
 ])
 st.dataframe(checks, use_container_width=True)
+
 
 st.markdown("**GM% by Month**")
 gm_by_m = df.groupby("month", as_index=False).agg(revenue=("extended_price", "sum"), cogs=("cogs", "sum"))
