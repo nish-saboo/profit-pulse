@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
-import plotly.graph_objects as go  # NEW: for PVM waterfall
+import plotly.graph_objects as go  # Plotly for PVM waterfall
 
 # =========================
 # Config & Constants
@@ -56,7 +56,7 @@ TOTAL_COST_COLS = ["cogs", "cost_amount", "cost_of_goods_sold", "total_cost", "l
 # UI: Header & About
 # =========================
 st.title(APP_TITLE)
-st.caption("Private-use diagnostic. Operates on anonymized CSV data only. No PII.")
+st.caption("Private-use diagnostic. Operates on anonymized CSV/Excel data only. No PII.")
 
 # =========================
 # Password Gate
@@ -83,7 +83,7 @@ mode = st.sidebar.radio(
 
 st.markdown(
     """
-**Expected CSV columns (anonymized IDs only):**
+**Expected columns (anonymized IDs only):**
 
 **Required (Quick):**
 - `date` (YYYY-MM-DD)
@@ -99,11 +99,11 @@ st.markdown(
 - `currency` (e.g., USD/EUR) — currency math is **flagged** unless acknowledged
 - `returns_qty`, `returns_amount`
 
-> Upload CSVs only to keep installs light. If your file is huge, we’ll auto-aggregate by `product_id × month` (and `customer_id × month` if present).
+> CSV and Excel (XLSX/XLS) accepted. For very large files, CSV is preferred. Huge files will auto-aggregate.
 """
 )
 
-# CSV templates for easy onboarding
+# CSV/Excel templates for easy onboarding
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
@@ -132,27 +132,27 @@ tmpl_cust = pd.DataFrame({
 
 c_t1, c_t2, c_t3 = st.columns(3)
 with c_t1:
-    st.download_button("Download Transactional Template", data=df_to_csv_bytes(tmpl_txn), file_name="transactional_template.csv", mime="text/csv")
+    st.download_button("Download Transactional Template (CSV)", data=df_to_csv_bytes(tmpl_txn), file_name="transactional_template.csv", mime="text/csv")
 with c_t2:
-    st.download_button("Download Product Master Template", data=df_to_csv_bytes(tmpl_prod), file_name="product_master_template.csv", mime="text/csv")
+    st.download_button("Download Product Master Template (CSV)", data=df_to_csv_bytes(tmpl_prod), file_name="product_master_template.csv", mime="text/csv")
 with c_t3:
-    st.download_button("Download Customer Master Template", data=df_to_csv_bytes(tmpl_cust), file_name="customer_master_template.csv", mime="text/csv")
+    st.download_button("Download Customer Master Template (CSV)", data=df_to_csv_bytes(tmpl_cust), file_name="customer_master_template.csv", mime="text/csv")
 
 # =========================
 # File Uploaders
 # =========================
 st.subheader("Upload Data")
-txn = st.file_uploader("Transactional CSV (required)", type=["csv"], key="txn")
+txn = st.file_uploader("Transactional file (CSV or Excel)", type=["csv", "xlsx", "xls"], key="txn")
 
 price = None
 cts = None
 prod_master = None
 cust_master = None
 if mode.startswith("Full"):
-    price = st.file_uploader("Optional: Price/Master CSV", type=["csv"], key="price")
-    cts = st.file_uploader("Optional: Cost-to-Serve CSV", type=["csv"], key="cts")
-    prod_master = st.file_uploader("Optional: Product Master CSV", type=["csv"], key="prod_master")
-    cust_master = st.file_uploader("Optional: Customer Master CSV", type=["csv"], key="cust_master")
+    price = st.file_uploader("Optional: Price/Master (CSV or Excel)", type=["csv", "xlsx", "xls"], key="price")
+    cts = st.file_uploader("Optional: Cost-to-Serve (CSV or Excel)", type=["csv", "xlsx", "xls"], key="cts")
+    prod_master = st.file_uploader("Optional: Product Master (CSV or Excel)", type=["csv", "xlsx", "xls"], key="prod_master")
+    cust_master = st.file_uploader("Optional: Customer Master (CSV or Excel)", type=["csv", "xlsx", "xls"], key="cust_master")
 
 period = st.radio("Rolling period", ["3 months", "6 months", "12 months", "Full dataset"], index=2)
 
@@ -208,31 +208,6 @@ def traffic(value, green_thresh, reverse=False):
         else:
             return ("Risk", COLOR["red"])
 
-def read_csv_safely(file, required_cols, sample_rows=10_000):
-    if file is None:
-        return pd.DataFrame(), False
-    if file.size and file.size > MAX_FILE_BYTES:
-        return aggregate_in_chunks(file, required_cols), True
-
-    file.seek(0)
-    try:
-        sample = pd.read_csv(file, nrows=sample_rows, low_memory=False)
-    except Exception as e:
-        raise RuntimeError(f"Failed to read CSV sample: {e}")
-
-    total_rows_estimate = None
-    if file.size and len(sample) > 0:
-        avg_row_size = max(1, int(file.size / max(1, len(sample))))
-        total_rows_estimate = int(file.size / avg_row_size)
-
-    if total_rows_estimate and total_rows_estimate > MAX_ROWS:
-        file.seek(0)
-        return aggregate_in_chunks(file, required_cols), True
-
-    file.seek(0)
-    df = pd.read_csv(file, low_memory=False)
-    return df, False
-
 def aggregate_in_chunks(file, required_cols):
     file.seek(0)
     chunks = pd.read_csv(file, chunksize=200_000, low_memory=False)
@@ -283,6 +258,96 @@ def aggregate_in_chunks(file, required_cols):
         agg["gm_pct"] = np.where(agg["revenue"] != 0, agg["gross_margin"] / agg["revenue"], np.nan)
 
     return agg if agg is not None else pd.DataFrame()
+
+def _post_aggregate(df: pd.DataFrame) -> pd.DataFrame:
+    # Normalize columns for derivation
+    df.columns = [c.lower().strip() for c in df.columns]
+    for col in ["date", "quantity", "unit_price", "unit_cost"]:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    df["date"] = pd.to_datetime(df.get("date"), errors="coerce")
+    df["month"] = df["date"].dt.to_period("M").dt.to_timestamp()
+    df["discount"] = pd.to_numeric(df.get("discount", 0), errors="coerce").fillna(0.0)
+    df["rebate"] = pd.to_numeric(df.get("rebate", 0), errors="coerce").fillna(0.0)
+    df["quantity"] = pd.to_numeric(df.get("quantity"), errors="coerce").fillna(0.0)
+    df["unit_price"] = pd.to_numeric(df.get("unit_price"), errors="coerce").fillna(0.0)
+    df["unit_cost"] = pd.to_numeric(df.get("unit_cost"), errors="coerce").fillna(0.0)
+
+    df["extended_price"] = df["quantity"] * df["unit_price"] - df["discount"] - df["rebate"]
+    df["cogs"] = df["quantity"] * df["unit_cost"]
+
+    group_keys = ["product_id", "month"]
+    if "customer_id" in df.columns:
+        group_keys = ["customer_id"] + group_keys
+
+    g = df.groupby(group_keys, dropna=False).agg(
+        quantity=("quantity", "sum"),
+        revenue=("extended_price", "sum"),
+        cogs=("cogs", "sum"),
+        discount=("discount", "sum"),
+        rebate=("rebate", "sum"),
+        txn_rows=("unit_price", "count"),
+    ).reset_index()
+    g["gross_margin"] = g["revenue"] - g["cogs"]
+    g["gm_pct"] = np.where(g["revenue"] != 0, g["gross_margin"] / g["revenue"], np.nan)
+    return g
+
+def read_any_safely(file, required_cols, sample_rows=10_000):
+    """
+    Load CSV (with chunked aggregation for very large files) or Excel (read fully, then post-aggregate if large).
+    Returns (df, aggregated_mode: bool)
+    """
+    if file is None:
+        return pd.DataFrame(), False
+
+    fname = (getattr(file, "name", "") or "").lower()
+    is_csv = fname.endswith(".csv")
+    is_xlsx = fname.endswith(".xlsx")
+    is_xls = fname.endswith(".xls")
+    size = getattr(file, "size", None)
+
+    # CSV path: keep efficient chunked mode if huge
+    if is_csv or not (is_xlsx or is_xls):
+        if size and size > MAX_FILE_BYTES:
+            return aggregate_in_chunks(file, required_cols), True
+
+        # Peek sample for rough size→row estimate
+        file.seek(0)
+        try:
+            sample = pd.read_csv(file, nrows=sample_rows, low_memory=False)
+        except Exception as e:
+            raise RuntimeError(f"Failed to read CSV sample: {e}")
+
+        total_rows_estimate = None
+        if size and len(sample) > 0:
+            avg_row_size = max(1, int(size / max(1, len(sample))))
+            total_rows_estimate = int(size / avg_row_size)
+
+        if total_rows_estimate and total_rows_estimate > MAX_ROWS:
+            file.seek(0)
+            return aggregate_in_chunks(file, required_cols), True
+
+        # Read all
+        file.seek(0)
+        df = pd.read_csv(file, low_memory=False)
+        return df, False
+
+    # Excel path: read fully (no chunked excel), then aggregate if huge
+    try:
+        file.seek(0)
+        if is_xlsx:
+            df = pd.read_excel(file, engine="openpyxl")
+        else:  # .xls
+            df = pd.read_excel(file, engine="xlrd")
+    except Exception as e:
+        raise RuntimeError(f"Failed to read Excel file: {e}")
+
+    aggregated = False
+    if (size and size > MAX_FILE_BYTES) or (len(df) > MAX_ROWS):
+        df = _post_aggregate(df)
+        aggregated = True
+    return df, aggregated
 
 def auto_map_by_synonyms(df: pd.DataFrame) -> pd.DataFrame:
     cols = [c.lower().strip() for c in df.columns]
@@ -387,8 +452,22 @@ def remediation_tier(missing_flags):
 def read_master_csv(file, key_cols, allowed_extra=None):
     if file is None:
         return None
+
+    fname = (getattr(file, "name", "") or "").lower()
+    is_xlsx = fname.endswith(".xlsx")
+    is_xls = fname.endswith(".xls")
+
     file.seek(0)
-    m = pd.read_csv(file, low_memory=False)
+    try:
+        if is_xlsx:
+            m = pd.read_excel(file, engine="openpyxl")
+        elif is_xls:
+            m = pd.read_excel(file, engine="xlrd")
+        else:
+            m = pd.read_csv(file, low_memory=False)
+    except Exception as e:
+        st.warning(f"Could not read master file ({fname}): {e}")
+        return None
 
     m.columns = [c.lower().strip() for c in m.columns]
     drop_cols = [c for c in m.columns if any(pat in c for pat in PII_PATTERNS)]
@@ -507,13 +586,13 @@ def pvm_plotly(prev_rev, price_eff, volume_eff, mix_eff, cur_rev):
 # Processing
 # =========================
 if txn is None:
-    st.info("Upload transactional CSV to begin.")
+    st.info("Upload transactional file to begin.")
     st.stop()
 
 required_cols = ["date", "product_id", "quantity", "unit_price", "unit_cost"]
 
 with st.spinner("Reading data..."):
-    df, aggregated = read_csv_safely(txn, required_cols)
+    df, aggregated = read_any_safely(txn, required_cols)
 
 if df.empty:
     st.error("The uploaded file appears to be empty or unreadable.")
