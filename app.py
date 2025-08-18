@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
+import plotly.graph_objects as go  # NEW: for PVM waterfall
 
 # =========================
 # Config & Constants
@@ -454,31 +455,53 @@ def generate_rule_based_insights(df, summary, thresholds):
 
     return insights[:8]
 
-def pvm_bridge(df):
+def pvm_effects(df):
+    """Return prev_rev, price_eff, volume_eff, mix_eff, cur_rev and total_delta."""
     m = df.groupby("month", as_index=False).agg(
         revenue=("extended_price", "sum"),
         qty=("quantity", "sum")
     ).sort_values("month")
     if len(m) < 2:
-        return None, None
+        return None
 
     cur, prev = m.iloc[-1], m.iloc[-2]
     p_prev = prev["revenue"] / prev["qty"] if prev["qty"] else 0.0
     p_cur  = cur["revenue"] / cur["qty"] if cur["qty"] else 0.0
 
-    # Effects (definitions unchanged)
     volume_eff = (cur["qty"] - prev["qty"]) * (p_prev)
     price_eff  = (p_cur - p_prev) * (cur["qty"])
     mix_eff    = (cur["revenue"] - prev["revenue"]) - volume_eff - price_eff
     total_delta = cur["revenue"] - prev["revenue"]
 
-    # New order: Prev, Price, Volume, Mix, Current
-    steps = pd.DataFrame({
-        "label": ["Prev Rev", "Price", "Volume", "Mix", "Cur Rev"],
-        "value": [prev["revenue"], price_eff, volume_eff, mix_eff, cur["revenue"]],
-        "type":  ["base", "posneg", "posneg", "posneg", "base"]
-    })
-    return steps, total_delta
+    return prev["revenue"], price_eff, volume_eff, mix_eff, cur["revenue"], total_delta
+
+def pvm_plotly(prev_rev, price_eff, volume_eff, mix_eff, cur_rev):
+    fig = go.Figure(go.Waterfall(
+        name="PVM",
+        orientation="v",
+        measure=["absolute", "relative", "relative", "relative", "absolute"],
+        x=["Prev Rev", "Price", "Volume", "Mix", "Cur Rev"],
+        textposition="outside",
+        text=[
+            f"${prev_rev:,.0f}",
+            f"${price_eff:,.0f}",
+            f"${volume_eff:,.0f}",
+            f"${mix_eff:,.0f}",
+            f"${cur_rev:,.0f}"
+        ],
+        y=[prev_rev, price_eff, volume_eff, mix_eff, cur_rev],
+        connector={"line": {"color":"#2E2E2E"}},
+        increasing={"marker":{"color": COLOR["green"]}},
+        decreasing={"marker":{"color": COLOR["red"]}},
+        totals={"marker":{"color": COLOR["blue"]}}
+    ))
+    fig.update_layout(
+        title="Revenue Bridge (P–V–M)",
+        showlegend=False,
+        margin=dict(l=20, r=20, t=40, b=20),
+        yaxis_title="Revenue"
+    )
+    return fig
 
 # =========================
 # Processing
@@ -724,31 +747,13 @@ st.subheader("Automated Insights (Local)")
 rb_insights = generate_rule_based_insights(df, summary, THR)
 st.write("• " + "\n• ".join(rb_insights) if rb_insights else "No notable rule-based findings from current data.")
 
-# Revenue Bridge (P–V–M) with new order
-steps, total_delta = pvm_bridge(df)
-if steps is not None:
+# Revenue Bridge (P–V–M) with Plotly
+eff = pvm_effects(df)
+if eff is not None:
+    prev_rev, price_eff, volume_eff, mix_eff, cur_rev, total_delta = eff
     st.subheader("Revenue Bridge (MoM P–V–M)")
-    base_start = steps.iloc[0]["value"]
-    wf = []
-    cur_val = base_start
-    for _, row in steps.iterrows():
-        if row["type"] == "posneg":
-            start = cur_val
-            end = cur_val + row["value"]
-            wf.append({"label": row["label"], "start": min(start, end), "height": abs(row["value"]), "color": COLOR["green"] if row["value"] >= 0 else COLOR["red"]})
-            cur_val = end
-        else:
-            wf.append({"label": row["label"], "start": row["value"], "height": 0.0, "color": COLOR["blue"]})
-    wf_df = pd.DataFrame(wf)
-    chart = alt.Chart(wf_df).mark_bar().encode(
-        x=alt.X("label:N", title=None),
-        y=alt.Y("start:Q", title="Revenue"),
-        y2="y2:Q",
-        color=alt.Color("color:N", scale=None)
-    ).transform_calculate(
-        y2="datum.start + datum.height"
-    ).properties(height=280)
-    st.altair_chart(chart, use_container_width=True)
+    fig = pvm_plotly(prev_rev, price_eff, volume_eff, mix_eff, cur_rev)
+    st.plotly_chart(fig, use_container_width=True)
     st.caption(f"Δ Revenue vs prior month: {total_delta:,.0f}")
 
 # Quality & Outliers
