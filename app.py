@@ -1,5 +1,6 @@
 import io
 import json
+import os
 from datetime import datetime
 
 import numpy as np
@@ -154,6 +155,27 @@ if mode.startswith("Full"):
 
 period = st.radio("Rolling period", ["3 months", "6 months", "12 months", "Full dataset"], index=2)
 
+# --- Run button to gate processing ---
+if "run_analytics" not in st.session_state:
+    st.session_state["run_analytics"] = False
+
+cols_btn = st.columns([1,1,6])
+with cols_btn[0]:
+    run_clicked = st.button("Generate Analytics", type="primary", help="Click after loading files and choosing mode/period")
+with cols_btn[1]:
+    if st.button("Reset"):
+        st.session_state["run_analytics"] = False
+        try:
+            st.rerun()
+        except AttributeError:
+            st.experimental_rerun()
+if run_clicked:
+    st.session_state["run_analytics"] = True
+
+if not st.session_state["run_analytics"]:
+    st.info("Load your files, choose Quick or Full, then click **Generate Analytics**.")
+    st.stop()
+
 # =========================
 # Utility Functions
 # =========================
@@ -186,6 +208,8 @@ def traffic(value, green_thresh, reverse=False):
             return ("Risk", COLOR["red"])
 
 def read_csv_safely(file, required_cols, sample_rows=10_000):
+    if file is None:
+        return pd.DataFrame(), False
     if file.size and file.size > MAX_FILE_BYTES:
         return aggregate_in_chunks(file, required_cols), True
 
@@ -277,9 +301,7 @@ def auto_map_by_synonyms(df: pd.DataFrame) -> pd.DataFrame:
 
 def fix_excel_serial_dates(df: pd.DataFrame) -> pd.DataFrame:
     if "date" in df.columns:
-        # Try to parse normally first
         parsed = pd.to_datetime(df["date"], errors="coerce")
-        # If mostly NaT and original is numeric, assume Excel serial
         if parsed.isna().mean() > 0.6:
             try:
                 if pd.api.types.is_numeric_dtype(df["date"]):
@@ -312,11 +334,9 @@ def derive_missing_price_cost(df: pd.DataFrame, issues: list) -> pd.DataFrame:
     return df
 
 def normalize_and_derive(df: pd.DataFrame) -> pd.DataFrame:
-    # Normalize column names
     cols = {c.lower().strip(): c for c in df.columns}
     df = df.rename(columns={v: k for k, v in cols.items()})
 
-    # Parse numeric types
     numeric_cols = [
         "quantity", "unit_price", "unit_cost",
         "discount", "rebate",
@@ -326,25 +346,19 @@ def normalize_and_derive(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Dates
     df["date"] = pd.to_datetime(df.get("date"), errors="coerce")
 
-    # Ensure discount/rebate exist as numeric
     df["discount"] = df["discount"].fillna(0.0) if "discount" in df.columns else 0.0
     df["rebate"]   = df["rebate"].fillna(0.0)   if "rebate" in df.columns else 0.0
-
-    # Returns optional
     df["returns_qty"] = df["returns_qty"].fillna(0.0) if "returns_qty" in df.columns else 0.0
     df["returns_amount"] = df["returns_amount"].fillna(0.0) if "returns_amount" in df.columns else 0.0
 
-    # Ensure base fields
     for base_col in ["quantity", "unit_price", "unit_cost"]:
         if base_col not in df.columns:
             df[base_col] = 0.0
         else:
             df[base_col] = df[base_col].fillna(0.0)
 
-    # Derivations
     df["extended_price"] = df["quantity"] * df["unit_price"] - df["discount"] - df["rebate"]
     df["cogs"] = df["quantity"] * df["unit_cost"]
     df["gross_margin"] = df["extended_price"] - df["cogs"]
@@ -376,7 +390,6 @@ def read_master_csv(file, key_cols, allowed_extra=None):
     m = pd.read_csv(file, low_memory=False)
 
     m.columns = [c.lower().strip() for c in m.columns]
-
     drop_cols = [c for c in m.columns if any(pat in c for pat in PII_PATTERNS)]
     m = m.drop(columns=drop_cols, errors="ignore")
 
@@ -453,15 +466,17 @@ def pvm_bridge(df):
     p_prev = prev["revenue"] / prev["qty"] if prev["qty"] else 0.0
     p_cur  = cur["revenue"] / cur["qty"] if cur["qty"] else 0.0
 
+    # Effects (definitions unchanged)
     volume_eff = (cur["qty"] - prev["qty"]) * (p_prev)
     price_eff  = (p_cur - p_prev) * (cur["qty"])
     mix_eff    = (cur["revenue"] - prev["revenue"]) - volume_eff - price_eff
     total_delta = cur["revenue"] - prev["revenue"]
 
+    # New order: Prev, Price, Volume, Mix, Current
     steps = pd.DataFrame({
-        "label": ["Prev Rev", "Volume", "Price", "Mix", "Cur Rev"],
-        "value": [prev["revenue"], volume_eff, price_eff, mix_eff, cur["revenue"]],
-        "type": ["base", "posneg", "posneg", "posneg", "base"]
+        "label": ["Prev Rev", "Price", "Volume", "Mix", "Cur Rev"],
+        "value": [prev["revenue"], price_eff, volume_eff, mix_eff, cur["revenue"]],
+        "type":  ["base", "posneg", "posneg", "posneg", "base"]
     })
     return steps, total_delta
 
@@ -679,6 +694,7 @@ chart = alt.Chart(gm_by_m).mark_line(point=True, color=COLOR["blue"]).encode(
 ).properties(height=280)
 st.altair_chart(chart, use_container_width=True)
 
+# Top/Bottom Products formatted
 st.markdown("**Top/Bottom Products by GM%**")
 if "product_id" in df.columns:
     prod = df.groupby("product_id", as_index=False).agg(
@@ -686,11 +702,20 @@ if "product_id" in df.columns:
         cogs=("cogs", "sum")
     )
     prod["gm_pct"] = np.where(prod["revenue"] != 0, (prod["revenue"] - prod["cogs"]) / prod["revenue"], np.nan)
+
+    def format_prod_table(frame):
+        out = frame.copy()
+        out["Revenue"] = out["revenue"].round(0).map(lambda x: f"${x:,.0f}")
+        out["COGS"] = out["cogs"].round(0).map(lambda x: f"${x:,.0f}")
+        out["GM%"] = out["gm_pct"].map(lambda x: ("N/A" if pd.isna(x) else f"{x:.1%}"))
+        return out[["product_id", "Revenue", "COGS", "GM%"]].rename(columns={"product_id": "Product"})
+
     top5 = prod.sort_values("gm_pct", ascending=False).head(5)
     bot5 = prod.sort_values("gm_pct", ascending=True).head(5)
+
     c1, c2 = st.columns(2)
-    c1.write("**Top 5**"); c1.dataframe(top5, use_container_width=True)
-    c2.write("**Bottom 5**"); c2.dataframe(bot5, use_container_width=True)
+    c1.write("**Top 5**"); c1.dataframe(format_prod_table(top5), use_container_width=True)
+    c2.write("**Bottom 5**"); c2.dataframe(format_prod_table(bot5), use_container_width=True)
 
 # =========================
 # Automated Insights
@@ -699,19 +724,19 @@ st.subheader("Automated Insights (Local)")
 rb_insights = generate_rule_based_insights(df, summary, THR)
 st.write("• " + "\n• ".join(rb_insights) if rb_insights else "No notable rule-based findings from current data.")
 
-# Revenue Bridge (P–V–M)
+# Revenue Bridge (P–V–M) with new order
 steps, total_delta = pvm_bridge(df)
 if steps is not None:
     st.subheader("Revenue Bridge (MoM P–V–M)")
     base_start = steps.iloc[0]["value"]
     wf = []
-    cur = base_start
+    cur_val = base_start
     for _, row in steps.iterrows():
         if row["type"] == "posneg":
-            start = cur
-            end = cur + row["value"]
+            start = cur_val
+            end = cur_val + row["value"]
             wf.append({"label": row["label"], "start": min(start, end), "height": abs(row["value"]), "color": COLOR["green"] if row["value"] >= 0 else COLOR["red"]})
-            cur = end
+            cur_val = end
         else:
             wf.append({"label": row["label"], "start": row["value"], "height": 0.0, "color": COLOR["blue"]})
     wf_df = pd.DataFrame(wf)
@@ -756,14 +781,21 @@ bullets = [
 st.write("• " + "\n• ".join(bullets))
 
 # =========================
-# AI Narration (ChatGPT) — optional
+# AI Narration (ChatGPT) — optional (lazy secrets/env)
 # =========================
 with st.expander("AI Narration (ChatGPT) — optional", expanded=False):
     enable_ai = st.checkbox("Enable ChatGPT narration (aggregated data only)", value=False)
     model = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o"], index=0) if enable_ai else None
 
-    default_key = st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None
-    api_key = st.text_input("OpenAI API Key (kept local; not stored)", type="password", value=default_key or "") if enable_ai else None
+    default_key = ""
+    if enable_ai:
+        default_key = os.getenv("OPENAI_API_KEY", "")
+        if not default_key:
+            try:
+                default_key = st.secrets["OPENAI_API_KEY"]
+            except Exception:
+                default_key = ""
+    api_key = st.text_input("OpenAI API Key (kept local; not stored)", type="password", value=default_key) if enable_ai else None
 
     include_samples = st.checkbox(
         "Include a few aggregated examples (never raw PII/rows)",
@@ -772,7 +804,7 @@ with st.expander("AI Narration (ChatGPT) — optional", expanded=False):
 
     if enable_ai:
         if not api_key:
-            st.info("Enter your OpenAI API key (or set st.secrets['OPENAI_API_KEY']).")
+            st.info("Enter your OpenAI API key (or set OPENAI_API_KEY env var or st.secrets['OPENAI_API_KEY']).")
         else:
             prompt = f"""
 You are a pricing and profitability analyst. Given aggregate metrics below, produce:
