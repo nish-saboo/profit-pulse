@@ -586,15 +586,9 @@ with render_cols[0]:
 with render_cols[1]:
     st.metric("Gross Margin", f"${summary['gross_margin']:,.0f}")
 with render_cols[2]:
-    if not pd.isna(summary["gm_pct"]):
-        st.metric("GM%", f"{summary['gm_pct']:.1%}")
-    else:
-        st.metric("GM%", "N/A")
+    st.metric("GM%", "N/A" if pd.isna(summary["gm_pct"]) else f"{summary['gm_pct']:.1%}")
 with render_cols[3]:
-    if not pd.isna(summary["disc_reb_pct"]):
-        st.metric("Discount+Rebate %", f"{summary['disc_reb_pct']:.1%}")
-    else:
-        st.metric("Discount+Rebate %", "N/A")
+    st.metric("Discount+Rebate %", "N/A" if pd.isna(summary["disc_reb_pct"]) else f"{summary['disc_reb_pct']:.1%}")
 
 # Traffic-light table
 st.markdown("**Traffic-light checks**")
@@ -660,8 +654,11 @@ if "product_id" in df.columns:
 # =========================
 # Automated Insights
 # =========================
+def generate_rule_based_insights_local(df, summary, THR):
+    return generate_rule_based_insights(df, summary, THR)
+
 st.subheader("Automated Insights (Local)")
-rb_insights = generate_rule_based_insights(df, summary, THR)
+rb_insights = generate_rule_based_insights_local(df, summary, THR)
 st.write("• " + "\n• ".join(rb_insights) if rb_insights else "No notable rule-based findings from current data.")
 
 # Revenue Bridge (P–V–M)
