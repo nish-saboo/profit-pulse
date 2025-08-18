@@ -39,6 +39,17 @@ COLOR = {
 
 PII_PATTERNS = ("name", "email", "phone", "mobile", "address", "tax", "ssn")
 
+# --- synonym-based auto mapping & derivations ---
+SYNONYMS = {
+    "date": ["invoice_date", "order_date", "posting_date", "transaction_date", "doc_date"],
+    "product_id": ["sku", "item_id", "product", "product_code", "material_code"],
+    "quantity": ["qty", "units", "qty_sold", "quantity_sold", "order_qty"],
+    "unit_price": ["price", "selling_price", "net_price", "unit_selling_price", "unit_list_price"],
+    "unit_cost": ["cost", "unit_cogs", "cogs_per_unit", "unit_cost_local", "std_cost", "standard_cost"],
+}
+TOTAL_REVENUE_COLS = ["revenue", "net_revenue", "net_amount", "amount", "sales_amount", "line_amount"]
+TOTAL_COST_COLS = ["cogs", "cost_amount", "cost_of_goods_sold", "total_cost", "line_cost"]
+
 # =========================
 # UI: Header & About
 # =========================
@@ -157,9 +168,6 @@ def parse_period_filter(df, col="date"):
     return df[df[col] >= cutoff]
 
 def traffic(value, green_thresh, reverse=False):
-    """
-    Returns (label, color) where green >= thresh (or <= if reverse=True).
-    """
     if pd.isna(value):
         return ("N/A", COLOR["amber"])
     if reverse:
@@ -178,40 +186,29 @@ def traffic(value, green_thresh, reverse=False):
             return ("Risk", COLOR["red"])
 
 def read_csv_safely(file, required_cols, sample_rows=10_000):
-    """
-    Try to read quickly. If file is very large or rows exceed threshold,
-    return (df_or_agg, used_agg_mode: bool)
-    """
     if file.size and file.size > MAX_FILE_BYTES:
         return aggregate_in_chunks(file, required_cols), True
 
-    # Peek a small sample to detect columns cheaply
     file.seek(0)
     try:
         sample = pd.read_csv(file, nrows=sample_rows, low_memory=False)
     except Exception as e:
         raise RuntimeError(f"Failed to read CSV sample: {e}")
 
-    # Estimate total rows if file size known
     total_rows_estimate = None
     if file.size and len(sample) > 0:
         avg_row_size = max(1, int(file.size / max(1, len(sample))))
         total_rows_estimate = int(file.size / avg_row_size)
 
-    # If too big, aggregate
     if total_rows_estimate and total_rows_estimate > MAX_ROWS:
         file.seek(0)
         return aggregate_in_chunks(file, required_cols), True
 
-    # Not too big: read all
     file.seek(0)
     df = pd.read_csv(file, low_memory=False)
     return df, False
 
 def aggregate_in_chunks(file, required_cols):
-    """
-    Chunked aggregation by product_id×month (and customer_id×month if available).
-    """
     file.seek(0)
     chunks = pd.read_csv(file, chunksize=200_000, low_memory=False)
     agg = None
@@ -220,7 +217,6 @@ def aggregate_in_chunks(file, required_cols):
         ch_cols = {c.lower().strip(): c for c in ch.columns}
         ch.rename(columns={v: k for k, v in ch_cols.items()}, inplace=True)
 
-        # Derivations
         for col in ["date", "quantity", "unit_price", "unit_cost"]:
             if col not in ch.columns:
                 ch[col] = np.nan
@@ -255,7 +251,6 @@ def aggregate_in_chunks(file, required_cols):
 
         agg = g if agg is None else pd.concat([agg, g], ignore_index=True)
 
-    # Combine duplicate keys after concatenation
     if agg is not None:
         by = [c for c in ["customer_id", "product_id", "month"] if c in agg.columns]
         agg = agg.groupby(by, dropna=False, as_index=False).sum(numeric_only=True)
@@ -264,14 +259,64 @@ def aggregate_in_chunks(file, required_cols):
 
     return agg if agg is not None else pd.DataFrame()
 
+def auto_map_by_synonyms(df: pd.DataFrame) -> pd.DataFrame:
+    cols = [c.lower().strip() for c in df.columns]
+    df.columns = cols
+    for req, alts in SYNONYMS.items():
+        if req not in df.columns:
+            for alt in alts:
+                if alt in df.columns:
+                    df.rename(columns={alt: req}, inplace=True)
+                    break
+    if "date" not in df.columns:
+        for c in df.columns:
+            if "date" in c:
+                df.rename(columns={c: "date"}, inplace=True)
+                break
+    return df
+
+def fix_excel_serial_dates(df: pd.DataFrame) -> pd.DataFrame:
+    if "date" in df.columns:
+        # Try to parse normally first
+        parsed = pd.to_datetime(df["date"], errors="coerce")
+        # If mostly NaT and original is numeric, assume Excel serial
+        if parsed.isna().mean() > 0.6:
+            try:
+                if pd.api.types.is_numeric_dtype(df["date"]):
+                    df["date"] = pd.to_datetime("1899-12-30") + pd.to_timedelta(df["date"].astype(float), unit="D")
+                else:
+                    df["date"] = parsed
+            except Exception:
+                df["date"] = parsed
+        else:
+            df["date"] = parsed
+    return df
+
+def derive_missing_price_cost(df: pd.DataFrame, issues: list) -> pd.DataFrame:
+    if "unit_price" not in df.columns and "quantity" in df.columns:
+        for col in TOTAL_REVENUE_COLS:
+            if col in df.columns:
+                q = pd.to_numeric(df["quantity"], errors="coerce").replace(0, np.nan)
+                amt = pd.to_numeric(df[col], errors="coerce")
+                df["unit_price"] = (amt / q).replace([np.inf, -np.inf], np.nan)
+                issues.append(f"Derived unit_price from `{col}` / quantity (check accuracy).")
+                break
+    if "unit_cost" not in df.columns and "quantity" in df.columns:
+        for col in TOTAL_COST_COLS:
+            if col in df.columns:
+                q = pd.to_numeric(df["quantity"], errors="coerce").replace(0, np.nan)
+                amt = pd.to_numeric(df[col], errors="coerce")
+                df["unit_cost"] = (amt / q).replace([np.inf, -np.inf], np.nan)
+                issues.append(f"Derived unit_cost from `{col}` / quantity (check accuracy).")
+                break
+    return df
+
 def normalize_and_derive(df: pd.DataFrame) -> pd.DataFrame:
-    # Normalize column names to lower snake
+    # Normalize column names
     cols = {c.lower().strip(): c for c in df.columns}
     df = df.rename(columns={v: k for k, v in cols.items()})
 
-    # Parse types
-    df["date"] = pd.to_datetime(df.get("date"), errors="coerce")
-
+    # Parse numeric types
     numeric_cols = [
         "quantity", "unit_price", "unit_cost",
         "discount", "rebate",
@@ -281,21 +326,25 @@ def normalize_and_derive(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Ensure discount/rebate columns always exist as numeric Series
+    # Dates
+    df["date"] = pd.to_datetime(df.get("date"), errors="coerce")
+
+    # Ensure discount/rebate exist as numeric
     df["discount"] = df["discount"].fillna(0.0) if "discount" in df.columns else 0.0
     df["rebate"]   = df["rebate"].fillna(0.0)   if "rebate" in df.columns else 0.0
 
-    # Returns columns optional, ensure numeric fallback
+    # Returns optional
     df["returns_qty"] = df["returns_qty"].fillna(0.0) if "returns_qty" in df.columns else 0.0
     df["returns_amount"] = df["returns_amount"].fillna(0.0) if "returns_amount" in df.columns else 0.0
 
-    # Derivations
+    # Ensure base fields
     for base_col in ["quantity", "unit_price", "unit_cost"]:
         if base_col not in df.columns:
             df[base_col] = 0.0
         else:
             df[base_col] = df[base_col].fillna(0.0)
 
+    # Derivations
     df["extended_price"] = df["quantity"] * df["unit_price"] - df["discount"] - df["rebate"]
     df["cogs"] = df["quantity"] * df["unit_cost"]
     df["gross_margin"] = df["extended_price"] - df["cogs"]
@@ -313,7 +362,6 @@ def data_completeness_score(df):
     return float(max(0.0, min(1.0, completeness)))
 
 def remediation_tier(missing_flags):
-    # A=minor, B=moderate, C=major issues
     score = 0
     for v in missing_flags.values():
         score += 2 if v else 0
@@ -322,29 +370,21 @@ def remediation_tier(missing_flags):
     return "A"
 
 def read_master_csv(file, key_cols, allowed_extra=None):
-    """
-    Reads a master CSV, normalizes columns, drops PII-like columns,
-    and returns only key + allowed attributes.
-    """
     if file is None:
         return None
     file.seek(0)
     m = pd.read_csv(file, low_memory=False)
 
-    # normalize col names
     m.columns = [c.lower().strip() for c in m.columns]
 
-    # drop PII-like columns
     drop_cols = [c for c in m.columns if any(pat in c for pat in PII_PATTERNS)]
     m = m.drop(columns=drop_cols, errors="ignore")
 
-    # ensure key columns present
     missing_keys = [k for k in key_cols if k not in m.columns]
     if missing_keys:
         st.warning(f"Master file is missing key columns: {missing_keys}. Skipping.")
         return None
 
-    # keep only keys + allowed extras
     cols_to_keep = list(key_cols)
     if allowed_extra:
         cols_to_keep += [c for c in allowed_extra if c in m.columns]
@@ -359,8 +399,6 @@ def scan_for_pii_columns(columns):
 
 def generate_rule_based_insights(df, summary, thresholds):
     insights = []
-
-    # Overall GM%
     gm = summary.get("gm_pct", np.nan)
     if not pd.isna(gm):
         if gm < thresholds["gm_green"]:
@@ -368,7 +406,6 @@ def generate_rule_based_insights(df, summary, thresholds):
         else:
             insights.append(f"GM% at {gm:.1%} meets/exceeds target — maintain pricing discipline.")
 
-    # Discounts + rebates
     dr = summary.get("disc_reb_pct", np.nan)
     if not pd.isna(dr):
         if dr > thresholds["disc_reb_green"]:
@@ -376,7 +413,6 @@ def generate_rule_based_insights(df, summary, thresholds):
         else:
             insights.append(f"Discount+Rebate load {dr:.1%} is within tolerance.")
 
-    # Returns
     if "returns_amount" in df.columns and summary["revenue"]:
         ret_pct = df["returns_amount"].sum() / summary["revenue"]
         if ret_pct > thresholds["returns_green"]:
@@ -384,7 +420,6 @@ def generate_rule_based_insights(df, summary, thresholds):
         else:
             insights.append(f"Returns at {ret_pct:.1%} look manageable.")
 
-    # Product outliers
     if "product_id" in df.columns:
         prod = df.groupby("product_id", as_index=False).agg(
             revenue=("extended_price", "sum"),
@@ -396,13 +431,11 @@ def generate_rule_based_insights(df, summary, thresholds):
         if not high_rev_low_gm.empty:
             insights.append(f"{len(high_rev_low_gm)} high-revenue SKUs have below-median GM% — candidates for price review or cost reduction.")
 
-    # Customer concentration (if present)
     if "customer_id" in df.columns:
         cust = df.groupby("customer_id", as_index=False)["extended_price"].sum().sort_values("extended_price", ascending=False)
         top10_share = cust["extended_price"].head(10).sum() / max(1e-9, cust["extended_price"].sum())
         insights.append(f"Top 10 customers contribute {top10_share:.1%} of revenue — monitor concentration risk.")
 
-    # Data quality
     if "currency" in df.columns:
         insights.append("Multi-currency detected — FX not normalized; compare GM% by currency or confirm policy.")
 
@@ -416,13 +449,10 @@ def pvm_bridge(df):
     if len(m) < 2:
         return None, None
 
-    # Compare last vs prior month
     cur, prev = m.iloc[-1], m.iloc[-2]
-    # Average prices
     p_prev = prev["revenue"] / prev["qty"] if prev["qty"] else 0.0
     p_cur  = cur["revenue"] / cur["qty"] if cur["qty"] else 0.0
 
-    # Effects
     volume_eff = (cur["qty"] - prev["qty"]) * (p_prev)
     price_eff  = (p_cur - p_prev) * (cur["qty"])
     mix_eff    = (cur["revenue"] - prev["revenue"]) - volume_eff - price_eff
@@ -451,11 +481,14 @@ if df.empty:
     st.error("The uploaded file appears to be empty or unreadable.")
     st.stop()
 
-# Column mapping UI if required columns are missing / differently named
-st.subheader("Schema Check & Column Mapping")
+# Normalize and apply auto-mapping & date fixes BEFORE schema UI
 df.columns = [c.lower().strip() for c in df.columns]
 scan_for_pii_columns(df.columns)
+df = auto_map_by_synonyms(df)
+df = fix_excel_serial_dates(df)
 
+# Schema Check & Column Mapping UI
+st.subheader("Schema Check & Column Mapping")
 missing_reqs = [c for c in required_cols if c not in df.columns]
 if missing_reqs:
     st.warning(f"Missing required columns: {missing_reqs}. Map them below if your file uses different names.")
@@ -463,22 +496,30 @@ if missing_reqs:
         col_map = {}
         for req in required_cols:
             options = ["-- none --"] + list(df.columns)
-            sel = st.selectbox(f"Map **{req}** to:", options, index=options.index(req) if req in df.columns else 0, key=f"map_{req}")
+            sel = st.selectbox(
+                f"Map **{req}** to:",
+                options,
+                index=options.index(req) if req in df.columns else 0,
+                key=f"map_{req}"
+            )
             if sel != "-- none --":
                 col_map[req] = sel
 
         if st.button("Apply Mapping"):
-            # Invert collisions by renaming current reqs to temp
             for req, src in col_map.items():
                 if req in df.columns and req != src:
                     df.rename(columns={req: f"__old_{req}__"}, inplace=True)
-            # Now rename selected sources to required names
             df.rename(columns={src: req for req, src in col_map.items()}, inplace=True)
             try:
                 st.rerun()
             except AttributeError:
                 st.experimental_rerun()
 
+# Try derivations before final check
+issues_precheck = []
+df = derive_missing_price_cost(df, issues_precheck)
+if issues_precheck:
+    st.caption("Derivations applied: " + " | ".join(issues_precheck))
 
 # Re-check requireds
 still_missing = [c for c in required_cols if c not in df.columns]
@@ -559,12 +600,10 @@ if missing_flags["qty_missing"]: issues.append("Some `quantity` values are missi
 if missing_flags["price_missing"]: issues.append("Some `unit_price` values are missing/invalid.")
 if missing_flags["cost_missing"]: issues.append("Some `unit_cost` values are missing/invalid.")
 if missing_flags["currency_unhandled"]: issues.append("`currency` present — multi-currency not normalized (flagged).")
-
 if issues:
     st.error("• " + "\n• ".join(issues))
 else:
     st.success("No critical structural issues detected in required fields.")
-
 st.caption("Next steps: supply missing fields; confirm currency handling; provide returns/discount/rebate detail if available.")
 
 # =========================
@@ -572,7 +611,6 @@ st.caption("Next steps: supply missing fields; confirm currency handling; provid
 # =========================
 st.subheader("Dashboard")
 
-# KPIs
 summary = {}
 summary["revenue"] = float(df["extended_price"].sum())
 summary["cogs"] = float(df["cogs"].sum())
@@ -581,9 +619,9 @@ summary["gm_pct"] = (summary["gross_margin"] / summary["revenue"]) if summary["r
 disc_reb_total = float(df["discount"].sum() + df["rebate"].sum())
 summary["disc_reb_pct"] = (disc_reb_total / (summary["revenue"] + disc_reb_total)) if (summary["revenue"] + disc_reb_total) else np.nan
 
-# Currency acknowledgement if present
 if "currency" in df.columns:
     st.info("⚠️ Currency column detected. FX normalization is not applied. Confirm if values are comparable across currencies.")
+
 render_cols = st.columns(4)
 with render_cols[0]:
     st.metric("Revenue", f"${summary['revenue']:,.0f}")
@@ -594,7 +632,6 @@ with render_cols[2]:
 with render_cols[3]:
     st.metric("Discount+Rebate %", "N/A" if pd.isna(summary["disc_reb_pct"]) else f"{summary['disc_reb_pct']:.1%}")
 
-# Traffic-light table
 st.markdown("**Traffic-light checks**")
 checks = pd.DataFrame([
     {
@@ -658,18 +695,14 @@ if "product_id" in df.columns:
 # =========================
 # Automated Insights
 # =========================
-def generate_rule_based_insights_local(df, summary, THR):
-    return generate_rule_based_insights(df, summary, THR)
-
 st.subheader("Automated Insights (Local)")
-rb_insights = generate_rule_based_insights_local(df, summary, THR)
+rb_insights = generate_rule_based_insights(df, summary, THR)
 st.write("• " + "\n• ".join(rb_insights) if rb_insights else "No notable rule-based findings from current data.")
 
 # Revenue Bridge (P–V–M)
 steps, total_delta = pvm_bridge(df)
 if steps is not None:
     st.subheader("Revenue Bridge (MoM P–V–M)")
-    # Build a simple waterfall using start+height bars
     base_start = steps.iloc[0]["value"]
     wf = []
     cur = base_start
@@ -741,7 +774,6 @@ with st.expander("AI Narration (ChatGPT) — optional", expanded=False):
         if not api_key:
             st.info("Enter your OpenAI API key (or set st.secrets['OPENAI_API_KEY']).")
         else:
-            # Build prompt from aggregates + rule-based insights
             prompt = f"""
 You are a pricing and profitability analyst. Given aggregate metrics below, produce:
 1) A 5–8 bullet executive narrative.
@@ -765,7 +797,6 @@ Instructions:
 - Avoid PII or specific names; refer to anonymized groups only.
 """.strip()
 
-            # Optional mini context of top products (aggregated, anonymized)
             extra_context = None
             if include_samples and "product_id" in df.columns:
                 prod = df.groupby("product_id", as_index=False).agg(
@@ -825,7 +856,7 @@ if "returns_amount" in df.columns and summary["revenue"]:
 
 if data_score < THR["data_green"]:
     risk.append("Data gaps may distort margin metrics; prioritize remediation before decisions.")
-if missing_flags["currency_unhandled"]:
+if "currency" in df.columns:
     risk.append("Multi-currency present without normalization; GM% may be skewed.")
 
 st.write("**Top 3–5 Levers**")
