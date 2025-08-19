@@ -113,7 +113,7 @@ with st.sidebar:
 
     txn = st.file_uploader("Transactional (required)", type=["csv", "xlsx", "xls"], key="txn", help="Drag & drop, CSV preferred for large files")
 
-    # Mode & Period (kept compact here)
+    # Mode & Period (compact)
     c_mode, c_period = st.columns([1,1])
     with c_mode:
         mode_radio = st.radio("Mode", ["Quick", "Full"], horizontal=True, label_visibility="collapsed")
@@ -574,7 +574,7 @@ if do_primary:
     kpi_cols[2].metric("GM%", "N/A" if pd.isna(summary["gm_pct"]) else f"{summary['gm_pct']:.1%}")
     kpi_cols[3].metric("Discount+Rebate %", "N/A" if pd.isna(summary["disc_reb_pct"]) else f"{summary['disc_reb_pct']:.1%}")
 
-    # ---- Threshold controls (horizontal) just above traffic lights ----
+    # ---- Threshold sliders (horizontal) above traffic lights ----
     st.markdown("**Thresholds (adjust to your rubric)**")
     tcol1, tcol2, tcol3, tcol4 = st.columns(4)
     with tcol1:
@@ -613,35 +613,51 @@ if do_primary:
     combo = alt.layer(bars, line).resolve_scale(y="independent").properties(height=360)
     st.altair_chart(combo, use_container_width=True)
 
-    # ---- Pareto (toggle Product/Customer) with cumulative % ----
-    st.subheader("Pareto (Revenue)")
-    available_dims = []
-    if "product_id" in df.columns: available_dims.append("Product")
-    if "customer_id" in df.columns: available_dims.append("Customer")
-    if not available_dims:
-        st.info("Neither product_id nor customer_id found for Pareto.")
+    # ---- Two Separate Pareto Charts (Product & Customer) ----
+    st.subheader("Pareto (Revenue) — Product & Customer")
+    p_cols = st.columns(2)
+
+    # Product Pareto
+    if "product_id" in df.columns:
+        with p_cols[0]:
+            st.write("**Product Pareto**")
+            pareto_p = (df.groupby("product_id", as_index=False)["extended_price"]
+                        .sum().rename(columns={"extended_price":"revenue"})
+                        .sort_values("revenue", ascending=False))
+            total_rev_p = max(1e-9, pareto_p["revenue"].sum())
+            pareto_p["cum_share"] = pareto_p["revenue"].cumsum() / total_rev_p
+            top_n_p = st.slider("Top N (Product)", min_value=20, max_value=min(500, len(pareto_p)), value=min(50, len(pareto_p)), step=10, key="pareto_prod_topn")
+            pv_p = pareto_p.head(top_n_p)
+            base_p = alt.Chart(pv_p).encode(x=alt.X("product_id:N", sort="-y", title="Product"))
+            bars_p = base_p.mark_bar(color="#2563eb").encode(y=alt.Y("revenue:Q", title="Revenue", axis=alt.Axis(format="$s")))
+            line_p = base_p.mark_line(color="#10b981", strokeWidth=3).encode(y=alt.Y("cum_share:Q", title="Cumulative %", axis=alt.Axis(format="%", orient="right")))
+            combo_p = alt.layer(bars_p, line_p).resolve_scale(y="independent").properties(height=320)
+            st.altair_chart(combo_p, use_container_width=True)
+            eighty_n_p = (pareto_p["cum_share"] <= 0.80).sum()
+            st.caption(f"Top 80% revenue reached by ~{eighty_n_p} product(s).")
     else:
-        pareto_dim = st.radio("Pareto by:", available_dims, horizontal=True)
-        group_key = "product_id" if pareto_dim == "Product" else "customer_id"
-        title_dim = "Product" if group_key == "product_id" else "Customer"
+        p_cols[0].info("No `product_id` found for Product Pareto.")
 
-        pareto = (df.groupby(group_key, as_index=False)["extended_price"]
-                  .sum().rename(columns={"extended_price":"revenue"})
-                  .sort_values("revenue", ascending=False))
-        total_rev = max(1e-9, pareto["revenue"].sum())
-        pareto["cum_share"] = pareto["revenue"].cumsum() / total_rev
-
-        top_n = st.slider("Show top N", min_value=20, max_value=min(500, len(pareto)), value=min(50, len(pareto)), step=10)
-        pareto_view = pareto.head(top_n)
-
-        base_p = alt.Chart(pareto_view).encode(x=alt.X(f"{group_key}:N", sort="-y", title=title_dim))
-        bars_p = base_p.mark_bar(color="#2563eb").encode(y=alt.Y("revenue:Q", title="Revenue", axis=alt.Axis(format="$s")))
-        line_p = base_p.mark_line(color="#10b981", strokeWidth=3).encode(y=alt.Y("cum_share:Q", title="Cumulative % of Revenue", axis=alt.Axis(format="%", orient="right")))
-        combo_p = alt.layer(bars_p, line_p).resolve_scale(y="independent").properties(height=320)
-        st.altair_chart(combo_p, use_container_width=True)
-
-        eighty_n = (pareto["cum_share"] <= 0.80).sum()
-        st.caption(f"Top 80% cumulative share reached by ~{eighty_n} {title_dim.lower()}(s).")
+    # Customer Pareto
+    if "customer_id" in df.columns:
+        with p_cols[1]:
+            st.write("**Customer Pareto**")
+            pareto_c = (df.groupby("customer_id", as_index=False)["extended_price"]
+                        .sum().rename(columns={"extended_price":"revenue"})
+                        .sort_values("revenue", ascending=False))
+            total_rev_c = max(1e-9, pareto_c["revenue"].sum())
+            pareto_c["cum_share"] = pareto_c["revenue"].cumsum() / total_rev_c
+            top_n_c = st.slider("Top N (Customer)", min_value=20, max_value=min(500, len(pareto_c)), value=min(50, len(pareto_c)), step=10, key="pareto_cust_topn")
+            pv_c = pareto_c.head(top_n_c)
+            base_c = alt.Chart(pv_c).encode(x=alt.X("customer_id:N", sort="-y", title="Customer"))
+            bars_c = base_c.mark_bar(color="#2563eb").encode(y=alt.Y("revenue:Q", title="Revenue", axis=alt.Axis(format="$s")))
+            line_c = base_c.mark_line(color="#10b981", strokeWidth=3).encode(y=alt.Y("cum_share:Q", title="Cumulative %", axis=alt.Axis(format="%", orient="right")))
+            combo_c = alt.layer(bars_c, line_c).resolve_scale(y="independent").properties(height=320)
+            st.altair_chart(combo_c, use_container_width=True)
+            eighty_n_c = (pareto_c["cum_share"] <= 0.80).sum()
+            st.caption(f"Top 80% revenue reached by ~{eighty_n_c} customer(s).")
+    else:
+        p_cols[1].info("No `customer_id` found for Customer Pareto.")
 
     # ---- PVM Waterfall (no scenarios blended) ----
     eff = pvm_effects(df)
