@@ -13,9 +13,8 @@ import plotly.graph_objects as go  # Plotly for PVM & scenario bridges
 # Config & Constants
 # =========================
 APP_TITLE = "Profit Pulse — Phase 1 Diagnostic"
-PASSWORD = os.getenv("PP_PASSWORD", "PP-PULSE")  # Must match your internal standard
+PASSWORD = os.getenv("PP_PASSWORD", "PP-PULSE")
 
-# Traffic-light thresholds (user-adjustable in sidebar)
 THR_DEFAULT = {
     "gm_green": 0.30,
     "disc_reb_green": 0.08,
@@ -23,13 +22,11 @@ THR_DEFAULT = {
     "data_green": 0.90,
 }
 
-# Large file guardrails
 MAX_FILE_BYTES = 250 * 1024 * 1024  # 250 MB
 MAX_ROWS = 1_000_000
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
-# Theme helpers
 COLOR = {
     "green": "#1a9c5d",
     "amber": "#f2a700",
@@ -41,7 +38,6 @@ COLOR = {
 
 PII_PATTERNS = ("name", "email", "phone", "mobile", "address", "tax", "ssn")
 
-# --- synonym-based auto mapping & derivations ---
 SYNONYMS = {
     "date": ["invoice_date", "order_date", "posting_date", "transaction_date", "doc_date"],
     "product_id": ["sku", "item_id", "item", "product", "product_code", "material", "material_code", "sku_code", "item_code"],
@@ -72,24 +68,7 @@ if not authed:
     st.stop()
 
 # =========================
-# Sidebar Controls (Thresholds & What-If)
-# =========================
-st.sidebar.subheader("Thresholds (traffic lights)")
-gm_thr = st.sidebar.slider("GM% target", 0.10, 0.60, THR_DEFAULT["gm_green"], 0.01)
-disc_thr = st.sidebar.slider("Discount+Rebate % (max)", 0.00, 0.30, THR_DEFAULT["disc_reb_green"], 0.005)
-ret_thr = st.sidebar.slider("Returns % (max)", 0.00, 0.10, THR_DEFAULT["returns_green"], 0.005)
-dat_thr = st.sidebar.slider("Data completeness (min)", 0.50, 1.00, THR_DEFAULT["data_green"], 0.01)
-THR = {"gm_green": gm_thr, "disc_reb_green": disc_thr, "returns_green": ret_thr, "data_green": dat_thr}
-
-st.sidebar.subheader("What‑If (Hypothetical)")
-price_delta = st.sidebar.slider("Price Δ %", -10.0, 10.0, 0.0, 0.5)
-cost_delta = st.sidebar.slider("Unit Cost Δ %", -10.0, 10.0, 0.0, 0.5)
-freight_delta = st.sidebar.slider("Freight Δ %", -20.0, 20.0, 0.0, 1.0)
-discount_cap = st.sidebar.slider("Discount Cap %", 0.0, 50.0, 50.0, 1.0)
-st.sidebar.caption("Scenarios are illustrative; not recommendations.")
-
-# =========================
-# Guidance & Templates (Sidebar)
+# Sidebar: Templates + Uploads (right under password)
 # =========================
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
@@ -119,13 +98,8 @@ tmpl_cust = pd.DataFrame({
     "channel_code": ["DTC", "RESELLER"],
 })
 
-with st.sidebar.expander("Guidance & Templates", expanded=False):
-    st.markdown(
-        """
-**Required:** `date`, `product_id`, `quantity`, `unit_price`, `unit_cost`  
-**Helpful:** `customer_id`, `discount`, `rebate`, `returns_amount`, `freight`, `currency`  
-**Note:** CSV/Excel only; large files auto‑aggregate.
-""")
+with st.sidebar:
+    st.markdown("**Templates**")
     c_t1, c_t2, c_t3 = st.columns(3)
     with c_t1:
         st.download_button("Txn CSV", data=df_to_csv_bytes(tmpl_txn), file_name="transactional_template.csv", mime="text/csv")
@@ -134,32 +108,22 @@ with st.sidebar.expander("Guidance & Templates", expanded=False):
     with c_t3:
         st.download_button("Customer CSV", data=df_to_csv_bytes(tmpl_cust), file_name="customer_master_template.csv", mime="text/csv")
 
-# =========================
-# Compact Uploaders (Sidebar)
-# =========================
-with st.sidebar.expander("Upload files", expanded=True):
-    # Required transactional
+    st.markdown("---")
+    st.markdown("**Upload files**")
+
     txn = st.file_uploader("Transactional (required)", type=["csv", "xlsx", "xls"], key="txn", help="Drag & drop, CSV preferred for large files")
 
-    # Mode control (Quick vs Full)
-    st.caption("Mode controls which optional files appear below.")
-    st.radio(
-        "Mode",
-        ["Quick (Transactional only)", "Full (Transactional + masters)"],
-        index=0,
-        key="__mode_radio__",
-        help="Switch to Full to reveal optional master uploads."
-    )
-    mode = "Full (Transactional + optional masters)" if st.session_state["__mode_radio__"] == "Full (Transactional + masters)" else "Quick (Transactional only)"
+    # Mode & Period (kept compact here)
+    c_mode, c_period = st.columns([1,1])
+    with c_mode:
+        mode_radio = st.radio("Mode", ["Quick", "Full"], horizontal=True, label_visibility="collapsed")
+    with c_period:
+        period = st.selectbox("Period", ["3 months", "6 months", "12 months", "Full dataset"], index=2, label_visibility="collapsed")
+    mode = "Full (Transactional + optional masters)" if mode_radio == "Full" else "Quick (Transactional only)"
 
-    # Rolling period
-    st.radio("Rolling period", ["3 months", "6 months", "12 months", "Full dataset"], index=2, key="__period_radio__")
-    period = st.session_state["__period_radio__"]
-
-    # Optional masters grid (only in Full)
+    # Optional masters grid when in Full
     price_file = None; cts = None; prod_master = None; cust_master = None; sales_rep_master = None; proj = None
-    if mode.startswith("Full"):
-        st.markdown("**Optional masters**")
+    if mode_radio == "Full":
         g1c1, g1c2 = st.columns(2)
         with g1c1:
             prod_master = st.file_uploader("Product Master", type=["csv", "xlsx", "xls"], key="prod_master")
@@ -450,28 +414,25 @@ if df.empty:
 df = auto_map_by_synonyms(df)
 df = fix_excel_serial_dates(df)
 
-# Try derivations if price/cost totals present
 issues_precheck = []
 df = derive_missing_price_cost(df, issues_precheck)
 if issues_precheck:
     st.caption("Derivations applied: " + " | ".join(issues_precheck))
 
-# Required fields check
 required_cols = ["date", "product_id", "quantity", "unit_price", "unit_cost"]
 missing_reqs = [c for c in required_cols if c not in df.columns]
 if missing_reqs:
     st.error(f"Missing required columns: {missing_reqs}. Please map/adjust and re-upload.")
     st.stop()
 
-# Normalize + derive metrics + rolling window
 with st.spinner("Normalizing & deriving metrics..."):
     df = normalize_and_derive(df)
     df = parse_period_filter(df)
 
-# ---- Optional master merges + validation alerts ----
+# Optional master merges
 if prod_master is not None:
     pm_allowed = ["category_code", "family_code", "brand_code", "size_tier", "uom", "launch_year"]
-    pm, pm_cols = read_master_csv(prod_master, key_cols=["product_id"], allowed_extra=pm_allowed, friendly="Product Master")
+    pm, _ = read_master_csv(prod_master, key_cols=["product_id"], allowed_extra=pm_allowed, friendly="Product Master")
     if pm is not None:
         df = df.merge(pm, on="product_id", how="left", validate="m:1")
         st.success("Product Master merged (keys: product_id).")
@@ -479,7 +440,7 @@ if prod_master is not None:
 
 if cust_master is not None:
     cm_allowed = ["segment_code", "region_code", "channel_code", "tier_code", "size_tier"]
-    cm, cm_cols = read_master_csv(cust_master, key_cols=["customer_id"], allowed_extra=cm_allowed, friendly="Customer Master")
+    cm, _ = read_master_csv(cust_master, key_cols=["customer_id"], allowed_extra=cm_allowed, friendly="Customer Master")
     if cm is not None:
         if "customer_id" not in df.columns:
             st.warning("Transactional file lacks `customer_id`; Customer Master skipped.")
@@ -490,7 +451,7 @@ if cust_master is not None:
 
 if price_file is not None:
     pf_allowed = ["list_price", "target_price", "floor_price", "segment_code", "customer_id"]
-    pf, pf_cols = read_master_csv(price_file, key_cols=["product_id"], allowed_extra=pf_allowed, friendly="Price File")
+    pf, _ = read_master_csv(price_file, key_cols=["product_id"], allowed_extra=pf_allowed, friendly="Price File")
     if pf is not None:
         how_keys = ["product_id"]
         if "customer_id" in pf.columns and "customer_id" in df.columns:
@@ -501,7 +462,7 @@ if price_file is not None:
 
 if sales_rep_master is not None:
     srm_allowed = ["region_code","team_code"]
-    srm, srm_cols = read_master_csv(sales_rep_master, key_cols=["sales_rep_id"], allowed_extra=srm_allowed, friendly="Sales Rep Master")
+    srm, _ = read_master_csv(sales_rep_master, key_cols=["sales_rep_id"], allowed_extra=srm_allowed, friendly="Sales Rep Master")
     if srm is not None:
         if "sales_rep_id" in df.columns:
             df = df.merge(srm, on="sales_rep_id", how="left", validate="m:1")
@@ -509,9 +470,7 @@ if sales_rep_master is not None:
         else:
             st.info("Transactional file has no `sales_rep_id`; Sales Rep Master not merged.")
 
-# =========================
-# Filters (placed BEFORE analytics)
-# =========================
+# Optional filters
 with st.sidebar.expander("Filters (optional)", expanded=False):
     if "category_code" in df.columns:
         cats = sorted([c for c in df["category_code"].dropna().unique()])
@@ -540,7 +499,7 @@ missing_flags = {
     "qty_missing": df["quantity"].isna().any(),
     "price_missing": df["unit_price"].isna().any(),
     "cost_missing": df["unit_cost"].isna().any(),
-    "currency_unhandled": "currency" in df.columns,  # present but unnormalized
+    "currency_unhandled": "currency" in df.columns,
 }
 def remediation_tier(flags):
     score = 0
@@ -567,7 +526,7 @@ else:
     st.success("No critical structural issues detected in required fields.")
 
 if "currency" in df.columns:
-    st.info("⚠️ Currency column detected. FX normalization is not applied. Confirm if values are comparable across currencies.")
+    st.info("⚠️ Currency column detected. FX normalization is not applied. Confirm comparability across currencies.")
 
 st.caption("Next steps: supply missing fields; confirm currency handling; provide returns/discount/rebate detail if available.")
 
@@ -578,11 +537,11 @@ c1, c2, c3 = st.columns([1,1,1])
 with c1:
     do_primary = st.button("Run Primary Analytics", type="primary", help="Dashboard, Trends, Pareto, PVM, insights.")
 with c2:
-    have_secondary_inputs = bool(mode.startswith("Full") and (prod_master is not None) and (cust_master is not None) and (price_file is not None))
+    have_secondary_inputs = bool((prod_master is not None) and (cust_master is not None) and (price_file is not None))
     do_secondary = st.button(
         "Generate Secondary Analytics",
         type="secondary",
-        help="Segmented profitability, SKU×Region, price policy, scatter (requires Product+Customer+Price files)",
+        help="Segmented profitability, SKU×Region, price policy, scatter (needs Product+Customer+Price).",
         disabled=not have_secondary_inputs
     )
 with c3:
@@ -600,74 +559,61 @@ if not (do_primary or do_secondary or do_scenarios):
 # =========================
 if do_primary:
     st.subheader("Dashboard")
-
     summary = {}
     summary["revenue"] = float(df["extended_price"].sum())
-    summary["cogs"] = float(df["cogs"].sum())
+    summary["cogs"] = float((df["cogs"] if "cogs" in df.columns else df["unit_cost"] * df["quantity"]).sum())
     summary["gross_margin"] = summary["revenue"] - summary["cogs"]
     summary["gm_pct"] = (summary["gross_margin"] / summary["revenue"]) if summary["revenue"] else np.nan
     disc_reb_total = float(df.get("discount", 0).sum() + df.get("rebate", 0).sum())
     denom = (summary["revenue"] + disc_reb_total) if (summary["revenue"] + disc_reb_total) else np.nan
     summary["disc_reb_pct"] = (disc_reb_total / denom) if denom and denom != 0 else np.nan
 
-    cols = st.columns(4)
-    cols[0].metric("Revenue", f"${summary['revenue']:,.0f}")
-    cols[1].metric("Gross Margin", f"${summary['gross_margin']:,.0f}")
-    cols[2].metric("GM%", "N/A" if pd.isna(summary["gm_pct"]) else f"{summary['gm_pct']:.1%}")
-    cols[3].metric("Discount+Rebate %", "N/A" if pd.isna(summary["disc_reb_pct"]) else f"{summary['disc_reb_pct']:.1%}")
+    kpi_cols = st.columns(4)
+    kpi_cols[0].metric("Revenue", f"${summary['revenue']:,.0f}")
+    kpi_cols[1].metric("Gross Margin", f"${summary['gross_margin']:,.0f}")
+    kpi_cols[2].metric("GM%", "N/A" if pd.isna(summary["gm_pct"]) else f"{summary['gm_pct']:.1%}")
+    kpi_cols[3].metric("Discount+Rebate %", "N/A" if pd.isna(summary["disc_reb_pct"]) else f"{summary['disc_reb_pct']:.1%}")
+
+    # ---- Threshold controls (horizontal) just above traffic lights ----
+    st.markdown("**Thresholds (adjust to your rubric)**")
+    tcol1, tcol2, tcol3, tcol4 = st.columns(4)
+    with tcol1:
+        gm_thr = st.slider("GM% target", 0.10, 0.60, THR_DEFAULT["gm_green"], 0.01, key="thr_gm")
+    with tcol2:
+        disc_thr = st.slider("Discount+Rebate % (max)", 0.00, 0.30, THR_DEFAULT["disc_reb_green"], 0.005, key="thr_disc")
+    with tcol3:
+        ret_thr = st.slider("Returns % (max)", 0.00, 0.10, THR_DEFAULT["returns_green"], 0.005, key="thr_ret")
+    with tcol4:
+        dat_thr = st.slider("Data completeness (min)", 0.50, 1.00, THR_DEFAULT["data_green"], 0.01, key="thr_dat")
+    THR = {"gm_green": gm_thr, "disc_reb_green": disc_thr, "returns_green": ret_thr, "data_green": dat_thr}
 
     st.markdown("**Traffic-light checks**")
     checks = pd.DataFrame([
-        {
-            "Metric": "GM%",
-            "Value": f"{summary['gm_pct']:.1%}" if not pd.isna(summary["gm_pct"]) else "N/A",
-            "Status": traffic(summary["gm_pct"], THR["gm_green"])[0],
-        },
-        {
-            "Metric": "Discount+Rebate %",
-            "Value": f"{summary['disc_reb_pct']:.1%}" if not pd.isna(summary["disc_reb_pct"]) else "N/A",
-            "Status": traffic(summary["disc_reb_pct"], THR["disc_reb_green"], reverse=True)[0],
-        },
-        {
-            "Metric": "Returns %",
-            "Value": (
-                f"{(df.get('returns_amount', pd.Series([0])).sum() / summary['revenue']):.1%}"
-                if "returns_amount" in df.columns and summary["revenue"]
-                else "N/A"
-            ),
-            "Status": (
-                traffic((df['returns_amount'].sum() / summary['revenue']), THR["returns_green"], reverse=True)[0]
-                if "returns_amount" in df.columns and summary["revenue"]
-                else "N/A"
-            ),
-        },
-        {
-            "Metric": "Data completeness",
-            "Value": f"{data_score:.0%}",
-            "Status": traffic(data_score, THR["data_green"])[0],
-        },
+        {"Metric": "GM%", "Value": f"{summary['gm_pct']:.1%}" if not pd.isna(summary["gm_pct"]) else "N/A",
+         "Status": traffic(summary["gm_pct"], THR["gm_green"])[0]},
+        {"Metric": "Discount+Rebate %", "Value": f"{summary['disc_reb_pct']:.1%}" if not pd.isna(summary["disc_reb_pct"]) else "N/A",
+         "Status": traffic(summary["disc_reb_pct"], THR["disc_reb_green"], reverse=True)[0]},
+        {"Metric": "Returns %",
+         "Value": (f"{(df.get('returns_amount', pd.Series([0])).sum() / summary['revenue']):.1%}" if "returns_amount" in df.columns and summary["revenue"] else "N/A"),
+         "Status": (traffic((df['returns_amount'].sum() / summary['revenue']), THR["returns_green"], reverse=True)[0] if "returns_amount" in df.columns and summary["revenue"] else "N/A")},
+        {"Metric": "Data completeness", "Value": f"{data_score:.0%}", "Status": traffic(data_score, THR["data_green"])[0]},
     ])
     st.dataframe(checks, use_container_width=True)
 
-    # ===== Trends: Revenue + GM% (combo dual-axis) =====
+    # ---- Revenue & GM% Trends (combo dual-axis) ----
     st.subheader("Revenue & GM% Trends")
     trend = df.groupby("month", as_index=False).agg(
         revenue=("extended_price", "sum"),
         gp=("gross_margin", "sum")
     )
     trend["gm_pct"] = np.where(trend["revenue"] != 0, trend["gp"] / trend["revenue"], np.nan)
-
     base = alt.Chart(trend).encode(x=alt.X("month:T", title="Month"))
-    bars = base.mark_bar(color="#2563eb").encode(
-        y=alt.Y("revenue:Q", title="Revenue", axis=alt.Axis(format="$s"))
-    )
-    line = base.mark_line(color="#10b981", strokeWidth=3).encode(
-        y=alt.Y("gm_pct:Q", title="GM%", axis=alt.Axis(format="%", orient="right"))
-    )
+    bars = base.mark_bar(color="#2563eb").encode(y=alt.Y("revenue:Q", title="Revenue", axis=alt.Axis(format="$s")))
+    line = base.mark_line(color="#10b981", strokeWidth=3).encode(y=alt.Y("gm_pct:Q", title="GM%", axis=alt.Axis(format="%", orient="right")))
     combo = alt.layer(bars, line).resolve_scale(y="independent").properties(height=360)
     st.altair_chart(combo, use_container_width=True)
 
-    # ===== Pareto (toggle Product / Customer) with cumulative % =====
+    # ---- Pareto (toggle Product/Customer) with cumulative % ----
     st.subheader("Pareto (Revenue)")
     available_dims = []
     if "product_id" in df.columns: available_dims.append("Product")
@@ -679,12 +625,9 @@ if do_primary:
         group_key = "product_id" if pareto_dim == "Product" else "customer_id"
         title_dim = "Product" if group_key == "product_id" else "Customer"
 
-        pareto = (
-            df.groupby(group_key, as_index=False)["extended_price"]
-              .sum()
-              .rename(columns={"extended_price": "revenue"})
-              .sort_values("revenue", ascending=False)
-        )
+        pareto = (df.groupby(group_key, as_index=False)["extended_price"]
+                  .sum().rename(columns={"extended_price":"revenue"})
+                  .sort_values("revenue", ascending=False))
         total_rev = max(1e-9, pareto["revenue"].sum())
         pareto["cum_share"] = pareto["revenue"].cumsum() / total_rev
 
@@ -692,19 +635,15 @@ if do_primary:
         pareto_view = pareto.head(top_n)
 
         base_p = alt.Chart(pareto_view).encode(x=alt.X(f"{group_key}:N", sort="-y", title=title_dim))
-        bars_p = base_p.mark_bar(color="#2563eb").encode(
-            y=alt.Y("revenue:Q", title="Revenue", axis=alt.Axis(format="$s"))
-        )
-        line_p = base_p.mark_line(color="#10b981", strokeWidth=3).encode(
-            y=alt.Y("cum_share:Q", title="Cumulative % of Revenue", axis=alt.Axis(format="%", orient="right"))
-        )
+        bars_p = base_p.mark_bar(color="#2563eb").encode(y=alt.Y("revenue:Q", title="Revenue", axis=alt.Axis(format="$s")))
+        line_p = base_p.mark_line(color="#10b981", strokeWidth=3).encode(y=alt.Y("cum_share:Q", title="Cumulative % of Revenue", axis=alt.Axis(format="%", orient="right")))
         combo_p = alt.layer(bars_p, line_p).resolve_scale(y="independent").properties(height=320)
         st.altair_chart(combo_p, use_container_width=True)
 
         eighty_n = (pareto["cum_share"] <= 0.80).sum()
         st.caption(f"Top 80% cumulative share reached by ~{eighty_n} {title_dim.lower()}(s).")
 
-    # ===== PVM Waterfall (no scenarios blended) =====
+    # ---- PVM Waterfall (no scenarios blended) ----
     eff = pvm_effects(df)
     if eff is not None:
         prev_rev, price_eff, volume_eff, mix_eff, cur_rev, total_delta = eff
@@ -713,52 +652,18 @@ if do_primary:
         st.plotly_chart(fig, use_container_width=True)
         st.caption(f"Δ Revenue vs prior month: {total_delta:,.0f}")
 
-    # ===== Automated Insights =====
+    # ---- Automated Insights ----
     st.subheader("Automated Insights (Local)")
     insights = []
-    gm = summary["gm_pct"]
-    if not pd.isna(gm):
-        insights.append("GM% on track." if gm >= THR["gm_green"] else "GM% below target — review pricing floors and costs.")
+    gm_val = summary["gm_pct"]
+    if not pd.isna(gm_val):
+        insights.append("GM% on track." if gm_val >= THR["gm_green"] else "GM% below target — review pricing floors and costs.")
     if not pd.isna(summary["disc_reb_pct"]):
-        if summary["disc_reb_pct"] > THR["disc_reb_green"]:
-            insights.append("Discount/REB load high — tighten approvals and exceptions.")
-        else:
-            insights.append("Discount/REB load within tolerance.")
+        insights.append("Discount/REB load within tolerance." if summary["disc_reb_pct"] <= THR["disc_reb_green"] else "Discount/REB load high — tighten approvals and exceptions.")
     if "returns_amount" in df.columns and summary["revenue"]:
         ret_pct = df["returns_amount"].sum() / summary["revenue"]
-        insights.append("Returns elevated — audit root causes." if ret_pct > THR["returns_green"] else "Returns manageable.")
+        insights.append("Returns manageable." if ret_pct <= THR["returns_green"] else "Returns elevated — audit root causes.")
     st.write("• " + "\n• ".join(insights) if insights else "No notable rule-based findings from current data.")
-
-    # ===== Executive Snapshot =====
-    st.subheader("Executive Snapshot (copy-paste)")
-    disc_reb_pct = summary["disc_reb_pct"]; disc_str = "N/A" if pd.isna(disc_reb_pct) else f"{disc_reb_pct:.1%}"
-    snapshot = f"""
-- GM%: {(summary['gm_pct'] if pd.notna(summary['gm_pct']) else 0):.1%} | Discount+Rebate: {disc_str} | Data completeness: {data_score:.0%}
-- Top levers: Price discipline, product mix focus, discount governance
-- Risks: Data gaps (IDs, cost), returns volatility, freight leakage
-- Questions: Where are policy exceptions? Which segments drive margin variance? What’s the returns root cause?
-""".strip()
-    st.code(snapshot)
-
-    # ===== Projections vs Actuals (Preview) =====
-    if proj is not None:
-        st.subheader("Projections vs. Actuals (Preview)")
-        dfp = read_any(proj)
-        dfp = _norm_cols(dfp)
-        if "date" in dfp.columns and "month" not in dfp.columns:
-            dfp["month"] = pd.to_datetime(dfp["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
-        actual = df.groupby(["product_id","month"], as_index=False).agg(revenue=("extended_price","sum"), qty=("quantity","sum"))
-        if {"product_id","month"}.issubset(dfp.columns):
-            projg = dfp.groupby(["product_id","month"], as_index=False).agg(rev_fcst=("extended_price","sum"), qty_fcst=("quantity","sum"))
-            merged = actual.merge(projg, on=["product_id","month"], how="inner")
-            if not merged.empty:
-                merged["rev_var"] = merged["revenue"] - merged["rev_fcst"]
-                merged["qty_var"] = merged["qty"] - merged["qty_fcst"]
-                st.dataframe(merged.head(50), use_container_width=True)
-                mape = np.mean(np.abs(merged["revenue"] - merged["rev_fcst"]) / np.maximum(merged["rev_fcst"], 1e-9))
-                st.caption(f"Experimental calibration hint: Revenue MAPE ≈ {mape:.1%}. Consider tempering price-lift assumptions where variance is high.")
-            else:
-                st.info("No overlapping keys to compare projections with actuals. Ensure product_id and month alignment.")
 
 # =========================
 # SECONDARY ANALYTICS
@@ -766,7 +671,7 @@ if do_primary:
 if do_secondary:
     st.subheader("Advanced Segment Analytics")
 
-    # Segmented profitability by segment × category
+    # Segment × Category
     if {"segment_code","category_code"}.issubset(df.columns):
         st.markdown("**Profitability by Segment × Category**")
         seg_cat = df.groupby(["segment_code","category_code"], as_index=False).agg(
@@ -782,7 +687,7 @@ if do_secondary:
         ).properties(height=360)
         st.altair_chart(chart, use_container_width=True)
 
-    # SKU × Region matrix with GM% & discount overlays (if region present)
+    # SKU × Region matrix
     if "region_code" in df.columns:
         st.markdown("**SKU × Region Matrix (GM% & Discount Load)**")
         mat = df.groupby(["product_id","region_code"], as_index=False).agg(
@@ -794,7 +699,6 @@ if do_secondary:
         )
         mat["gm_pct"] = np.where(mat["revenue"] != 0, (mat["revenue"] - mat["cogs"]) / mat["revenue"], np.nan)
         mat["disc_load"] = (mat["disc"] + mat["reb"]) / np.maximum(mat["revenue"] + mat["disc"] + mat["reb"], 1e-9)
-
         chart = alt.Chart(mat).mark_rect().encode(
             x=alt.X("region_code:N", title="Region"),
             y=alt.Y("product_id:N", title="Product"),
@@ -803,9 +707,8 @@ if do_secondary:
         ).properties(height=400)
         st.altair_chart(chart, use_container_width=True)
 
-    # Price band analysis vs policy
-    has_price_cols = any(c in df.columns for c in ["list_price","target_price","floor_price"])
-    if has_price_cols:
+    # Price band vs policy
+    if any(c in df.columns for c in ["list_price","target_price","floor_price"]):
         st.markdown("**Price Band Analysis vs. Policy**")
         pol = df.copy()
         pol["realized_price"] = np.where(pol["quantity"] != 0, pol["extended_price"] / np.maximum(pol["quantity"], 1e-9), pol["unit_price"])
@@ -828,7 +731,7 @@ if do_secondary:
         ).properties(height=300)
         st.altair_chart(chart, use_container_width=True)
 
-    # Customer profitability distribution
+    # Customer GM% distribution
     if "customer_id" in df.columns:
         st.markdown("**Customer GM% Distribution**")
         cust = df.groupby("customer_id", as_index=False).agg(
@@ -844,7 +747,7 @@ if do_secondary:
             use_container_width=True
         )
 
-    # Contribution waterfall by tier or segment
+    # Contribution waterfall by tier/segment
     tier_dim = "tier_code" if "tier_code" in df.columns else ("segment_code" if "segment_code" in df.columns else None)
     if tier_dim:
         st.markdown(f"**Contribution by {tier_dim}**")
@@ -862,7 +765,7 @@ if do_secondary:
         fig.update_layout(height=320, title=f"Gross Margin Contribution by {tier_dim}")
         st.plotly_chart(fig, use_container_width=True)
 
-    # Revenue vs GM% scatter — grouped by Customer × Product × Sales Rep
+    # Revenue vs GM% scatter — Customer × Product × Sales Rep
     dims = [d for d in ["customer_id","product_id","sales_rep_id"] if d in df.columns]
     if len(dims) == 3:
         st.markdown("**Revenue vs GM% — Customer × Product × Sales Rep**")
@@ -872,10 +775,8 @@ if do_secondary:
             qty=("quantity","sum")
         )
         grp["gm_pct"] = np.where(grp["revenue"] != 0, (grp["revenue"] - grp["cogs"]) / grp["revenue"], np.nan)
-
         topn = st.slider("Limit points by top revenue groups", min_value=50, max_value=5000, value=min(500, len(grp)), step=50)
         grp = grp.sort_values("revenue", ascending=False).head(topn)
-
         scatter = alt.Chart(grp).mark_circle(size=80, opacity=0.6).encode(
             x=alt.X("revenue:Q", title="Revenue", scale=alt.Scale(type="log", nice=False, zero=False)),
             y=alt.Y("gm_pct:Q", title="GM%", axis=alt.Axis(format="%")),
@@ -892,28 +793,31 @@ if do_secondary:
     else:
         st.info("Scatter needs customer_id, product_id, and sales_rep_id to be present.")
 
-    st.success("Secondary analytics complete.")
-
 # =========================
 # WHAT‑IF SCENARIOS (SEPARATE VISUALS)
 # =========================
 if do_scenarios:
     st.subheader("What‑If Scenarios (Hypothetical) — Separate Visuals")
 
-    st.markdown(
-        f"""
-**Assumptions being tested (global):**
-- Price Δ: **{price_delta:.1f}%**
-- Unit Cost Δ: **{cost_delta:.1f}%**
-- Freight Δ: **{freight_delta:.1f}%**
-- Discount Cap: **{discount_cap:.1f}%** of pre-discount line value (applies where current discounts exceed the cap)
+    # Horizontal controls with 1-line descriptions
+    cA, cB, cC, cD = st.columns(4)
+    with cA:
+        price_delta = st.slider("Price Δ %", -10.0, 10.0, 0.0, 0.5)
+        st.caption("Tests a uniform change in realized unit prices.")
+    with cB:
+        cost_delta = st.slider("Unit Cost Δ %", -10.0, 10.0, 0.0, 0.5)
+        st.caption("Tests production/COGS changes per unit.")
+    with cC:
+        freight_delta = st.slider("Freight Δ %", -20.0, 20.0, 0.0, 1.0)
+        st.caption("Tests logistics/handling cost changes (if provided).")
+    with cD:
+        discount_cap = st.slider("Discount Cap %", 0.0, 50.0, 50.0, 1.0)
+        st.caption("Caps discount+rebate vs pre‑discount line value.")
 
-**Method (illustrative only, not advice):**
-1) Adjust realized unit price by Price Δ;  
-2) Adjust unit cost by Unit Cost Δ;  
-3) Adjust freight (if present) by Freight Δ;  
-4) Cap discounts+rebates at the Discount Cap%;  
-5) Recalculate revenue, COGS, and gross margin and compare vs baseline.
+    st.markdown(
+        """
+**Method (illustrative, not advice):**  
+Apply the deltas/cap, recompute revenue/COGS/freight, and bridge **Baseline → Price → Cost → Discount Cap → Freight → Scenario**.
 """
     )
 
@@ -930,10 +834,10 @@ if do_scenarios:
 
     scenario_rev = scenario["quantity"] * scenario_unit_price - capped_discounts
     scenario_cogs = scenario["quantity"] * scenario_unit_cost
-    scenario_gm = scenario_rev - scenario_cogs - scenario_freight  # pocket-like if freight exists
+    scenario_gm = scenario_rev - scenario_cogs - scenario_freight
 
     base_rev = float(df["extended_price"].sum())
-    base_cogs = float(df["cogs"].sum())
+    base_cogs = float((df["cogs"] if "cogs" in df.columns else df["unit_cost"] * df["quantity"]).sum())
     base_freight = float(df.get("freight", pd.Series([0]*len(df))).sum())
     base_gm = base_rev - base_cogs - base_freight
 
@@ -942,13 +846,13 @@ if do_scenarios:
     sc_freight = float(scenario_freight.sum())
     sc_gm = float(scenario_gm.sum())
 
-    t1, t2, t3, t4 = st.columns(4)
-    t1.metric("Revenue (Baseline)", f"${base_rev:,.0f}")
-    t2.metric("Revenue (Scenario)", f"${sc_rev:,.0f}", delta=f"${(sc_rev - base_rev):,.0f}")
-    t3.metric("Gross Margin (Baseline)", f"${base_gm:,.0f}")
-    t4.metric("Gross Margin (Scenario)", f"${sc_gm:,.0f}", delta=f"${(sc_gm - base_gm):,.0f}")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Revenue (Baseline)", f"${base_rev:,.0f}")
+    m2.metric("Revenue (Scenario)", f"${sc_rev:,.0f}", delta=f"${(sc_rev - base_rev):,.0f}")
+    m3.metric("Gross Margin (Baseline)", f"${base_gm:,.0f}")
+    m4.metric("Gross Margin (Scenario)", f"${sc_gm:,.0f}", delta=f"${(sc_gm - base_gm):,.0f}")
 
-    # Scenario Waterfall — Baseline → Price → Cost → Discount Cap → Freight → Scenario
+    # Scenario Bridge
     qty = scenario["quantity"]
     base_price = df["unit_price"]
     base_cost = df["unit_cost"]
@@ -988,7 +892,7 @@ if do_scenarios:
     ))
     fig.update_layout(title="Scenario Bridge — Baseline → Scenario", height=360)
     st.plotly_chart(fig, use_container_width=True)
-    st.caption("Order of effects is illustrative. This is not financial advice; validate in BI before any action.")
+    st.caption("Order of effects is illustrative. Validate in BI before any action. Not financial advice.")
 
 # =========================
 # Assumptions & Formulas
