@@ -67,6 +67,10 @@ with st.sidebar:
 if not authed:
     st.stop()
 
+# Persistent view state (prevents sliders from resetting section)
+if "view" not in st.session_state:
+    st.session_state.view = None
+
 # =========================
 # Sidebar: Templates + Uploads (right under password)
 # =========================
@@ -257,7 +261,7 @@ def aggregate_in_chunks(file):
         return agg
     return pd.DataFrame()
 
-def derive_missing_price_cost(df: pd.DataFrame, issues: list) -> pd.DataFrame:
+def derive_missing_price_cost(df: pd.DataFrame, issues: list) -> pdDataFrame:
     if "unit_price" not in df.columns and "quantity" in df.columns:
         for col in TOTAL_REVENUE_COLS:
             if col in df.columns:
@@ -531,33 +535,50 @@ if "currency" in df.columns:
 st.caption("Next steps: supply missing fields; confirm currency handling; provide returns/discount/rebate detail if available.")
 
 # =========================
-# Analytics Triggers (AFTER remediation)
+# Analytics Triggers (AFTER remediation) — persistent view
 # =========================
+have_secondary_inputs = bool((prod_master is not None) and (cust_master is not None) and (price_file is not None))
+
 c1, c2, c3 = st.columns([1,1,1])
 with c1:
-    do_primary = st.button("Run Primary Analytics", type="primary", help="Dashboard, Trends, Pareto, PVM, insights.")
+    if st.button("Run Primary Analytics", type="primary", help="Dashboard, Trends, Pareto, PVM, insights."):
+        st.session_state.view = "primary"
 with c2:
-    have_secondary_inputs = bool((prod_master is not None) and (cust_master is not None) and (price_file is not None))
-    do_secondary = st.button(
+    if st.button(
         "Generate Secondary Analytics",
         type="secondary",
         help="Segmented profitability, SKU×Region, price policy, scatter (needs Product+Customer+Price).",
         disabled=not have_secondary_inputs
-    )
+    ):
+        st.session_state.view = "secondary"
 with c3:
-    do_scenarios = st.button(
-        "Run What‑If Scenarios",
-        type="secondary",
-        help="Separate hypothetical scenario visuals with explicit assumptions."
-    )
+    if st.button("Run What‑If Scenarios", type="secondary", help="Separate hypothetical scenario visuals with explicit assumptions."):
+        st.session_state.view = "scenarios"
 
-if not (do_primary or do_secondary or do_scenarios):
+# Quick nav (optional)
+nc1, nc2, nc3, nc4 = st.columns([1,1,1,1])
+with nc1:
+    if st.button("↺ Reset view"):
+        st.session_state.view = None
+with nc2:
+    if st.button("↤ Primary"):
+        st.session_state.view = "primary"
+with nc3:
+    if st.button("↦ Secondary", disabled=not have_secondary_inputs):
+        st.session_state.view = "secondary"
+with nc4:
+    if st.button("★ Scenarios"):
+        st.session_state.view = "scenarios"
+
+view = st.session_state.view
+if view is None:
+    st.info("Choose an analysis to run using the buttons above.")
     st.stop()
 
 # =========================
 # PRIMARY ANALYTICS
 # =========================
-if do_primary:
+if view == "primary":
     st.subheader("Dashboard")
     summary = {}
     summary["revenue"] = float(df["extended_price"].sum())
@@ -574,7 +595,7 @@ if do_primary:
     kpi_cols[2].metric("GM%", "N/A" if pd.isna(summary["gm_pct"]) else f"{summary['gm_pct']:.1%}")
     kpi_cols[3].metric("Discount+Rebate %", "N/A" if pd.isna(summary["disc_reb_pct"]) else f"{summary['disc_reb_pct']:.1%}")
 
-    # ---- Threshold sliders (horizontal) above traffic lights ----
+    # Threshold sliders (horizontal) above traffic lights
     st.markdown("**Thresholds (adjust to your rubric)**")
     tcol1, tcol2, tcol3, tcol4 = st.columns(4)
     with tcol1:
@@ -600,7 +621,7 @@ if do_primary:
     ])
     st.dataframe(checks, use_container_width=True)
 
-    # ---- Revenue & GM% Trends (combo dual-axis) ----
+    # Revenue & GM% Trends (combo dual-axis)
     st.subheader("Revenue & GM% Trends")
     trend = df.groupby("month", as_index=False).agg(
         revenue=("extended_price", "sum"),
@@ -613,11 +634,10 @@ if do_primary:
     combo = alt.layer(bars, line).resolve_scale(y="independent").properties(height=360)
     st.altair_chart(combo, use_container_width=True)
 
-    # ---- Two Separate Pareto Charts (Product & Customer) ----
+    # Two Separate Pareto Charts (Product & Customer)
     st.subheader("Pareto (Revenue) — Product & Customer")
     p_cols = st.columns(2)
 
-    # Product Pareto
     if "product_id" in df.columns:
         with p_cols[0]:
             st.write("**Product Pareto**")
@@ -638,7 +658,6 @@ if do_primary:
     else:
         p_cols[0].info("No `product_id` found for Product Pareto.")
 
-    # Customer Pareto
     if "customer_id" in df.columns:
         with p_cols[1]:
             st.write("**Customer Pareto**")
@@ -659,7 +678,7 @@ if do_primary:
     else:
         p_cols[1].info("No `customer_id` found for Customer Pareto.")
 
-    # ---- PVM Waterfall (no scenarios blended) ----
+    # PVM Waterfall (no scenarios blended)
     eff = pvm_effects(df)
     if eff is not None:
         prev_rev, price_eff, volume_eff, mix_eff, cur_rev, total_delta = eff
@@ -668,7 +687,7 @@ if do_primary:
         st.plotly_chart(fig, use_container_width=True)
         st.caption(f"Δ Revenue vs prior month: {total_delta:,.0f}")
 
-    # ---- Automated Insights ----
+    # Automated Insights
     st.subheader("Automated Insights (Local)")
     insights = []
     gm_val = summary["gm_pct"]
@@ -684,7 +703,7 @@ if do_primary:
 # =========================
 # SECONDARY ANALYTICS
 # =========================
-if do_secondary:
+if view == "secondary":
     st.subheader("Advanced Segment Analytics")
 
     # Segment × Category
@@ -812,7 +831,7 @@ if do_secondary:
 # =========================
 # WHAT‑IF SCENARIOS (SEPARATE VISUALS)
 # =========================
-if do_scenarios:
+if view == "scenarios":
     st.subheader("What‑If Scenarios (Hypothetical) — Separate Visuals")
 
     # Horizontal controls with 1-line descriptions
