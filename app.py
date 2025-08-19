@@ -1,6 +1,7 @@
 import os
 import io
 import math
+import hashlib
 from datetime import datetime
 
 import numpy as np
@@ -67,9 +68,11 @@ with st.sidebar:
 if not authed:
     st.stop()
 
-# Persistent view state (prevents sliders from resetting section)
+# Persistent view and input digests
 if "view" not in st.session_state:
     st.session_state.view = None
+if "last_txn_digest" not in st.session_state:
+    st.session_state.last_txn_digest = None
 
 # =========================
 # Sidebar: Templates + Uploads (right under password)
@@ -142,6 +145,69 @@ with st.sidebar:
         with g2c2:
             proj = st.file_uploader("Projections (preview)", type=["csv", "xlsx", "xls"], key="proj")
 
+# Reset view when new transactional content appears
+if txn is not None:
+    txn_bytes = txn.getvalue()
+    cur_digest = hashlib.md5(txn_bytes).hexdigest()
+    if st.session_state.last_txn_digest != cur_digest:
+        st.session_state.view = None
+        st.session_state.last_txn_digest = cur_digest
+else:
+    st.info("Upload transactional file to begin.")
+    st.stop()
+
+# =========================
+# Cacheable Readers
+# =========================
+@st.cache_data(show_spinner=False)
+def read_any_cached(file_bytes: bytes, ext: str) -> pd.DataFrame:
+    bio = io.BytesIO(file_bytes)
+    ext = (ext or "").lower()
+    if ext.endswith(".xlsx"):
+        return pd.read_excel(bio, engine="openpyxl")
+    if ext.endswith(".xls"):
+        return pd.read_excel(bio, engine="xlrd")
+    return pd.read_csv(bio, low_memory=False)
+
+@st.cache_data(show_spinner=False)
+def aggregate_in_chunks_cached(file_bytes: bytes) -> pd.DataFrame:
+    bio = io.BytesIO(file_bytes)
+    agg = None
+    for ch in pd.read_csv(bio, chunksize=200_000, low_memory=False):
+        ch.columns = [c.lower().strip() for c in ch.columns]
+        for req, alts in SYNONYMS.items():
+            if req not in ch.columns:
+                for alt in alts:
+                    if alt in ch.columns:
+                        ch.rename(columns={alt: req}, inplace=True)
+                        break
+        ch["date"] = pd.to_datetime(ch.get("date"), errors="coerce")
+        for col in ["quantity","unit_price","unit_cost","discount","rebate"]:
+            if col in ch.columns:
+                ch[col] = pd.to_numeric(ch[col], errors="coerce").fillna(0.0)
+        ch["extended_price"] = ch.get("quantity",0) * ch.get("unit_price",0) - ch.get("discount",0) - ch.get("rebate",0)
+        ch["cogs"] = ch.get("quantity",0) * ch.get("unit_cost",0)
+        ch["month"] = ch["date"].dt.to_period("M").dt.to_timestamp()
+        keys = ["product_id","month"]
+        if "customer_id" in ch.columns:
+            keys = ["customer_id"] + keys
+        g = ch.groupby(keys, dropna=False).agg(
+            quantity=("quantity","sum"),
+            revenue=("extended_price","sum"),
+            cogs=("cogs","sum"),
+            discount=("discount","sum"),
+            rebate=("rebate","sum"),
+        ).reset_index()
+        agg = g if agg is None else pd.concat([agg, g], ignore_index=True)
+
+    if agg is not None:
+        by = [c for c in ["customer_id","product_id","month"] if c in agg.columns]
+        agg = agg.groupby(by, dropna=False, as_index=False).sum(numeric_only=True)
+        agg["gross_margin"] = agg["revenue"] - agg["cogs"]
+        agg["gm_pct"] = np.where(agg["revenue"] != 0, agg["gross_margin"]/agg["revenue"], np.nan)
+        return agg
+    return pd.DataFrame()
+
 # =========================
 # Helpers
 # =========================
@@ -207,60 +273,6 @@ def fix_excel_serial_dates(df: pd.DataFrame) -> pd.DataFrame:
             df["date"] = parsed
     return df
 
-def read_any(file):
-    if file is None:
-        return pd.DataFrame()
-    fname = (getattr(file, "name", "") or "").lower()
-    is_xlsx = fname.endswith(".xlsx")
-    is_xls = fname.endswith(".xls")
-    try:
-        file.seek(0)
-        if is_xlsx:
-            return pd.read_excel(file, engine="openpyxl")
-        elif is_xls:
-            return pd.read_excel(file, engine="xlrd")
-        else:
-            return pd.read_csv(file, low_memory=False)
-    except Exception as e:
-        st.error(f"Failed to read file `{fname}`: {e}")
-        return pd.DataFrame()
-
-def aggregate_in_chunks(file):
-    file.seek(0)
-    chunks = pd.read_csv(file, chunksize=200_000, low_memory=False)
-    agg = None
-    for ch in chunks:
-        ch = auto_map_by_synonyms(_norm_cols(ch))
-        ch = fix_excel_serial_dates(ch)
-        for col in ["quantity","unit_price","unit_cost","discount","rebate"]:
-            if col in ch.columns:
-                ch[col] = pd.to_numeric(ch[col], errors="coerce").fillna(0.0)
-        ch["date"] = pd.to_datetime(ch.get("date"), errors="coerce")
-        ch["extended_price"] = ch.get("quantity",0) * ch.get("unit_price",0) - ch.get("discount",0) - ch.get("rebate",0)
-        ch["cogs"] = ch.get("quantity",0) * ch.get("unit_cost",0)
-        ch["month"] = ch["date"].dt.to_period("M").dt.to_timestamp()
-
-        keys = ["product_id","month"]
-        if "customer_id" in ch.columns:
-            keys = ["customer_id"] + keys
-
-        g = ch.groupby(keys, dropna=False).agg(
-            quantity=("quantity","sum"),
-            revenue=("extended_price","sum"),
-            cogs=("cogs","sum"),
-            discount=("discount","sum"),
-            rebate=("rebate","sum")
-        ).reset_index()
-        agg = g if agg is None else pd.concat([agg, g], ignore_index=True)
-
-    if agg is not None:
-        by = [c for c in ["customer_id","product_id","month"] if c in agg.columns]
-        agg = agg.groupby(by, dropna=False, as_index=False).sum(numeric_only=True)
-        agg["gross_margin"] = agg["revenue"] - agg["cogs"]
-        agg["gm_pct"] = np.where(agg["revenue"] != 0, agg["gross_margin"]/agg["revenue"], np.nan)
-        return agg
-    return pd.DataFrame()
-
 def derive_missing_price_cost(df: pd.DataFrame, issues: list) -> pd.DataFrame:
     if "unit_price" not in df.columns and "quantity" in df.columns:
         for col in TOTAL_REVENUE_COLS:
@@ -315,101 +327,52 @@ def data_completeness_score(df):
     completeness = 1.0 - (avail.isna().sum().sum() / (len(avail.columns) * len(avail)))
     return float(max(0.0, min(1.0, completeness)))
 
-def read_master_csv(file, key_cols, allowed_extra=None, friendly="master"):
-    if file is None:
-        return None, None
-    raw = read_any(file)
+def read_master_csv_bytes(file_bytes: bytes, filename: str, key_cols, allowed_extra=None, friendly="master"):
+    raw = read_any_cached(file_bytes, filename)
     if raw.empty:
         st.warning(f"{friendly} is empty or unreadable.")
         return None, None
     m = _norm_cols(raw)
     drop_cols = [c for c in m.columns if any(pat in c for pat in PII_PATTERNS)]
     m = m.drop(columns=drop_cols, errors="ignore")
-
     missing_keys = [k for k in key_cols if k not in m.columns]
     if missing_keys:
         st.warning(f"{friendly} is missing key columns: {missing_keys}. Skipping.")
         return None, None
-
     cols_to_keep = list(key_cols)
     if allowed_extra:
         cols_to_keep += [c for c in allowed_extra if c in m.columns]
     m = m[cols_to_keep].drop_duplicates()
     return m, raw.columns.tolist()
 
-def unmatched_alert(base_df, base_key, master_df, master_key, master_name):
+def unmatched_alert_and_coverage(base_df, base_key, master_df, master_key, master_name, weight_col="extended_price"):
     if base_key not in base_df.columns or master_df is None or master_key not in master_df.columns:
         return
-    left = base_df[[base_key]].dropna().drop_duplicates()
-    right = master_df[[master_key]].dropna().drop_duplicates()
-    merged = left.merge(right, left_on=base_key, right_on=master_key, how="left", indicator=True)
-    missing_ct = (merged["_merge"] == "left_only").sum()
+    left = base_df[[base_key, weight_col]].dropna(subset=[base_key]).copy()
+    left["_w"] = left[weight_col]
+    coverage = float(left[base_key].isin(master_df[master_key]).astype(int).mul(left["_w"]).sum()) / max(1e-9, float(left["_w"].sum()))
+    st.caption(f"{master_name} coverage by revenue: **{coverage:.1%}**")
+    # Unmatched count sample
+    missing_ct = (~left[base_key].isin(master_df[master_key])).sum()
     if missing_ct > 0:
-        sample = merged.loc[merged["_merge"]=="left_only", base_key].head(10).astype(str).tolist()
-        st.warning(f"Unmatched {base_key} in {master_name}: {missing_ct} not found. Sample: {sample}")
+        sample = left.loc[~left[base_key].isin(master_df[master_key]), base_key].astype(str).head(10).tolist()
+        st.warning(f"Unmatched {base_key} in {master_name}: {missing_ct} distinct values not found. Sample: {sample}")
 
-def pvm_effects(df):
-    m = df.groupby("month", as_index=False).agg(
-        revenue=("extended_price", "sum"),
-        qty=("quantity", "sum")
-    ).sort_values("month")
-    if len(m) < 2:
-        return None
-    cur, prev = m.iloc[-1], m.iloc[-2]
-    p_prev = prev["revenue"] / prev["qty"] if prev["qty"] else 0.0
-    p_cur  = cur["revenue"] / cur["qty"] if cur["qty"] else 0.0
-    volume_eff = (cur["qty"] - prev["qty"]) * (p_prev)
-    price_eff  = (p_cur - p_prev) * (cur["qty"])
-    mix_eff    = (cur["revenue"] - prev["revenue"]) - volume_eff - price_eff
-    total_delta = cur["revenue"] - prev["revenue"]
-    return prev["revenue"], price_eff, volume_eff, mix_eff, cur["revenue"], total_delta
-
-def pvm_plotly(prev_rev, price_eff, volume_eff, mix_eff, cur_rev):
-    fig = go.Figure(go.Waterfall(
-        name="PVM",
-        orientation="v",
-        measure=["absolute", "relative", "relative", "relative", "absolute"],
-        x=["Prev Rev", "Price", "Volume", "Mix", "Cur Rev"],
-        textposition="outside",
-        text=[
-            f"${prev_rev:,.0f}",
-            f"${price_eff:,.0f}",
-            f"${volume_eff:,.0f}",
-            f"${mix_eff:,.0f}",
-            f"${cur_rev:,.0f}"
-        ],
-        y=[prev_rev, price_eff, volume_eff, mix_eff, cur_rev],
-        connector={"line": {"color":"#2E2E2E"}},
-        increasing={"marker":{"color": COLOR["green"]}},
-        decreasing={"marker":{"color": COLOR["red"]}},
-        totals={"marker":{"color": COLOR["blue"]}}
-    ))
-    fig.update_layout(
-        title="Revenue Bridge (P–V–M)",
-        showlegend=False,
-        margin=dict(l=20, r=20, t=40, b=20),
-        yaxis_title="Revenue"
-    )
-    return fig
+def download_df(df: pd.DataFrame, label: str, name: str):
+    st.download_button(f"Download {label} (CSV)", df.to_csv(index=False).encode("utf-8"), file_name=name, mime="text/csv")
 
 # =========================
-# Processing up to ETL & Remediation
+# Read Transactional (cached) + Basic ETL
 # =========================
-if txn is None:
-    st.info("Upload transactional file to begin.")
-    st.stop()
+txn_ext = (txn.name if txn else "").lower()
+size_bytes = len(txn_bytes)
 
-with st.spinner("Reading transactional data..."):
-    fname = (getattr(txn, "name", "") or "").lower()
-    size = getattr(txn, "size", None)
-    is_csv = fname.endswith(".csv")
-
-    if is_csv and size and size > MAX_FILE_BYTES:
-        df = aggregate_in_chunks(txn)
-        aggregated = True
-    else:
-        df = read_any(txn)
-        aggregated = False
+if txn_ext.endswith(".csv") and (size_bytes > MAX_FILE_BYTES):
+    df = aggregate_in_chunks_cached(txn_bytes)
+    aggregated = True
+else:
+    df = read_any_cached(txn_bytes, txn_ext)
+    aggregated = False
 
 if df.empty:
     st.error("The uploaded transactional file appears to be empty or unreadable.")
@@ -418,6 +381,38 @@ if df.empty:
 df = auto_map_by_synonyms(df)
 df = fix_excel_serial_dates(df)
 
+# Manual mapping UI (restore) for keys with safe fallbacks
+def manual_map_ui(df: pd.DataFrame, key: str, synonyms: list, descriptor_hints=("name","desc","description","title","label")):
+    if key in df.columns:
+        return df
+    cand = next((c for c in synonyms if c in df.columns), None)
+    if cand:
+        df.rename(columns={cand: key}, inplace=True)
+        return df
+    st.warning(f"Missing `{key}`. Map a column manually, or derive a surrogate (limited diagnostic).")
+    choice = st.selectbox(f"Select a column to use as `{key}`", options=["— none —"] + list(df.columns), index=0, key=f"map_{key}")
+    if choice != "— none —":
+        if choice != key:
+            df.rename(columns={choice: key}, inplace=True)
+        return df
+    # surrogate from descriptor
+    desc_cols = [c for c in df.columns if any(h in c for h in descriptor_hints)]
+    if desc_cols:
+        base_col = desc_cols[0]
+        st.info(f"Deriving surrogate `{key}` from `{base_col}` (hash). Names will not be echoed.")
+        df[key] = df[base_col].fillna("UNK").astype(str).apply(lambda s: key[:1].upper() + hashlib.sha1(s.encode()).hexdigest()[:10])
+        return df
+    st.warning(f"Using `{key}='UNKNOWN'` (Tier C remediation). Results aggregated across unknown {key.split('_')[0]}.")
+    df[key] = "UNKNOWN"
+    return df
+
+df = manual_map_ui(df, "product_id", SYNONYMS["product_id"])
+if "customer_id" not in df.columns:
+    df = manual_map_ui(df, "customer_id", SYNONYMS.get("customer_id", []))
+if "sales_rep_id" not in df.columns:
+    df = manual_map_ui(df, "sales_rep_id", SYNONYMS.get("sales_rep_id", []))
+
+# Try derivations for price/cost
 issues_precheck = []
 df = derive_missing_price_cost(df, issues_precheck)
 if issues_precheck:
@@ -426,50 +421,75 @@ if issues_precheck:
 required_cols = ["date", "product_id", "quantity", "unit_price", "unit_cost"]
 missing_reqs = [c for c in required_cols if c not in df.columns]
 if missing_reqs:
-    st.error(f"Missing required columns: {missing_reqs}. Please map/adjust and re-upload.")
+    st.error(f"Missing required columns after mapping: {missing_reqs}. Please adjust and re-upload.")
     st.stop()
 
 with st.spinner("Normalizing & deriving metrics..."):
     df = normalize_and_derive(df)
     df = parse_period_filter(df)
 
-# Optional master merges
-if prod_master is not None:
-    pm_allowed = ["category_code", "family_code", "brand_code", "size_tier", "uom", "launch_year"]
-    pm, _ = read_master_csv(prod_master, key_cols=["product_id"], allowed_extra=pm_allowed, friendly="Product Master")
-    if pm is not None:
-        df = df.merge(pm, on="product_id", how="left", validate="m:1")
-        st.success("Product Master merged (keys: product_id).")
-        unmatched_alert(df, "product_id", pm, "product_id", "Product Master")
+# Hard guards
+bad_qty = int((df["quantity"] <= 0).sum())
+neg_price = int((df["unit_price"] < 0).sum())
+neg_cost = int((df["unit_cost"] < 0).sum())
+if bad_qty or neg_price or neg_cost:
+    msgs = []
+    if bad_qty: msgs.append(f"{bad_qty} rows with quantity ≤ 0")
+    if neg_price: msgs.append(f"{neg_price} rows with negative unit_price")
+    if neg_cost: msgs.append(f"{neg_cost} rows with negative unit_cost")
+    st.warning("Data issues detected: " + "; ".join(msgs) + ". These rows can skew metrics.")
+df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-if cust_master is not None:
+if aggregated:
+    st.warning("Large file detected. Aggregation mode in effect (month × product, and customer if present).")
+
+# =========================
+# Optional master merges (cached reads)
+# =========================
+def read_upload_bytes(u):
+    return (u.getvalue(), u.name) if u is not None else (None, None)
+
+pm_df = cm_df = pf_df = srm_df = None
+prod_bytes, prod_name = read_upload_bytes(prod_master)
+cust_bytes, cust_name = read_upload_bytes(cust_master)
+price_bytes, price_name = read_upload_bytes(price_file)
+srep_bytes, srep_name = read_upload_bytes(sales_rep_master)
+
+if prod_bytes:
+    pm_allowed = ["category_code", "family_code", "brand_code", "size_tier", "uom", "launch_year"]
+    pm_df, _ = read_master_csv_bytes(prod_bytes, prod_name, key_cols=["product_id"], allowed_extra=pm_allowed, friendly="Product Master")
+    if pm_df is not None:
+        df = df.merge(pm_df, on="product_id", how="left", validate="m:1")
+        st.success("Product Master merged (keys: product_id).")
+        unmatched_alert_and_coverage(df, "product_id", pm_df, "product_id", "Product Master")
+
+if cust_bytes:
     cm_allowed = ["segment_code", "region_code", "channel_code", "tier_code", "size_tier"]
-    cm, _ = read_master_csv(cust_master, key_cols=["customer_id"], allowed_extra=cm_allowed, friendly="Customer Master")
-    if cm is not None:
+    cm_df, _ = read_master_csv_bytes(cust_bytes, cust_name, key_cols=["customer_id"], allowed_extra=cm_allowed, friendly="Customer Master")
+    if cm_df is not None:
         if "customer_id" not in df.columns:
             st.warning("Transactional file lacks `customer_id`; Customer Master skipped.")
         else:
-            df = df.merge(cm, on="customer_id", how="left", validate="m:1")
+            df = df.merge(cm_df, on="customer_id", how="left", validate="m:1")
             st.success("Customer Master merged (keys: customer_id).")
-            unmatched_alert(df, "customer_id", cm, "customer_id", "Customer Master")
+            unmatched_alert_and_coverage(df, "customer_id", cm_df, "customer_id", "Customer Master")
 
-if price_file is not None:
+if price_bytes:
     pf_allowed = ["list_price", "target_price", "floor_price", "segment_code", "customer_id"]
-    pf, _ = read_master_csv(price_file, key_cols=["product_id"], allowed_extra=pf_allowed, friendly="Price File")
-    if pf is not None:
+    pf_df, _ = read_master_csv_bytes(price_bytes, price_name, key_cols=["product_id"], allowed_extra=pf_allowed, friendly="Price File")
+    if pf_df is not None:
         how_keys = ["product_id"]
-        if "customer_id" in pf.columns and "customer_id" in df.columns:
+        if ("customer_id" in pf_df.columns) and ("customer_id" in df.columns):
             how_keys = ["product_id", "customer_id"]
-        df = df.merge(pf, on=how_keys, how="left", validate="m:m")
+        df = df.merge(pf_df, on=how_keys, how="left", validate="m:m")
         st.success(f"Price File merged (keys: {', '.join(how_keys)}).")
-        unmatched_alert(df, "product_id", pf, "product_id", "Price File")
 
-if sales_rep_master is not None:
+if srep_bytes:
     srm_allowed = ["region_code","team_code"]
-    srm, _ = read_master_csv(sales_rep_master, key_cols=["sales_rep_id"], allowed_extra=srm_allowed, friendly="Sales Rep Master")
-    if srm is not None:
+    srm_df, _ = read_master_csv_bytes(srep_bytes, srep_name, key_cols=["sales_rep_id"], allowed_extra=srm_allowed, friendly="Sales Rep Master")
+    if srm_df is not None:
         if "sales_rep_id" in df.columns:
-            df = df.merge(srm, on="sales_rep_id", how="left", validate="m:1")
+            df = df.merge(srm_df, on="sales_rep_id", how="left", validate="m:1")
             st.success("Sales Rep Master merged (keys: sales_rep_id).")
         else:
             st.info("Transactional file has no `sales_rep_id`; Sales Rep Master not merged.")
@@ -499,7 +519,7 @@ st.subheader("Data Remediation Plan")
 
 missing_flags = {
     "date_missing": df["date"].isna().any(),
-    "product_id_missing": "product_id" not in df.columns or df["product_id"].isna().any(),
+    "product_id_missing": df["product_id"].isna().any(),
     "qty_missing": df["quantity"].isna().any(),
     "price_missing": df["unit_price"].isna().any(),
     "cost_missing": df["unit_cost"].isna().any(),
@@ -519,7 +539,7 @@ data_score = data_completeness_score(df)
 st.write(f"**Tier {tier}** — data completeness: **{data_score:.0%}**")
 issues = []
 if missing_flags["date_missing"]: issues.append("Some `date` values are missing or invalid.")
-if missing_flags["product_id_missing"]: issues.append("`product_id` missing or contains nulls.")
+if missing_flags["product_id_missing"]: issues.append("`product_id` contains nulls.")
 if missing_flags["qty_missing"]: issues.append("Some `quantity` values are missing/invalid.")
 if missing_flags["price_missing"]: issues.append("Some `unit_price` values are missing/invalid.")
 if missing_flags["cost_missing"]: issues.append("Some `unit_cost` values are missing/invalid.")
@@ -530,7 +550,11 @@ else:
     st.success("No critical structural issues detected in required fields.")
 
 if "currency" in df.columns:
-    st.info("⚠️ Currency column detected. FX normalization is not applied. Confirm comparability across currencies.")
+    cur_share = df.groupby("currency", as_index=False)["extended_price"].sum()
+    total_rev_cur = max(1e-9, cur_share["extended_price"].sum())
+    cur_share["share"] = cur_share["extended_price"] / total_rev_cur
+    st.info("⚠️ Multi-currency detected (no FX normalization). Revenue share by currency shown below.")
+    st.dataframe(cur_share.assign(share=lambda x: (x["share"]*100).round(1)), use_container_width=True)
 
 st.caption("Next steps: supply missing fields; confirm currency handling; provide returns/discount/rebate detail if available.")
 
@@ -633,8 +657,9 @@ if view == "primary":
     line = base.mark_line(color="#10b981", strokeWidth=3).encode(y=alt.Y("gm_pct:Q", title="GM%", axis=alt.Axis(format="%", orient="right")))
     combo = alt.layer(bars, line).resolve_scale(y="independent").properties(height=360)
     st.altair_chart(combo, use_container_width=True)
+    download_df(trend, "Trends", "trend.csv")
 
-    # Two Separate Pareto Charts (Product & Customer)
+    # Two Separate Pareto Charts (Product & Customer) with cumulative %
     st.subheader("Pareto (Revenue) — Product & Customer")
     p_cols = st.columns(2)
 
@@ -655,6 +680,7 @@ if view == "primary":
             st.altair_chart(combo_p, use_container_width=True)
             eighty_n_p = (pareto_p["cum_share"] <= 0.80).sum()
             st.caption(f"Top 80% revenue reached by ~{eighty_n_p} product(s).")
+            download_df(pareto_p, "Product Pareto", "pareto_product.csv")
     else:
         p_cols[0].info("No `product_id` found for Product Pareto.")
 
@@ -675,10 +701,55 @@ if view == "primary":
             st.altair_chart(combo_c, use_container_width=True)
             eighty_n_c = (pareto_c["cum_share"] <= 0.80).sum()
             st.caption(f"Top 80% revenue reached by ~{eighty_n_c} customer(s).")
+            download_df(pareto_c, "Customer Pareto", "pareto_customer.csv")
     else:
         p_cols[1].info("No `customer_id` found for Customer Pareto.")
 
     # PVM Waterfall (no scenarios blended)
+    def pvm_effects(df):
+        m = df.groupby("month", as_index=False).agg(
+            revenue=("extended_price", "sum"),
+            qty=("quantity", "sum")
+        ).sort_values("month")
+        if len(m) < 2:
+            return None
+        cur, prev = m.iloc[-1], m.iloc[-2]
+        p_prev = prev["revenue"] / prev["qty"] if prev["qty"] else 0.0
+        p_cur  = cur["revenue"] / cur["qty"] if cur["qty"] else 0.0
+        volume_eff = (cur["qty"] - prev["qty"]) * (p_prev)
+        price_eff  = (p_cur - p_prev) * (cur["qty"])
+        mix_eff    = (cur["revenue"] - prev["revenue"]) - volume_eff - price_eff
+        total_delta = cur["revenue"] - prev["revenue"]
+        return prev["revenue"], price_eff, volume_eff, mix_eff, cur["revenue"], total_delta
+
+    def pvm_plotly(prev_rev, price_eff, volume_eff, mix_eff, cur_rev):
+        fig = go.Figure(go.Waterfall(
+            name="PVM",
+            orientation="v",
+            measure=["absolute", "relative", "relative", "relative", "absolute"],
+            x=["Prev Rev", "Price", "Volume", "Mix", "Cur Rev"],
+            textposition="outside",
+            text=[
+                f"${prev_rev:,.0f}",
+                f"${price_eff:,.0f}",
+                f"${volume_eff:,.0f}",
+                f"${mix_eff:,.0f}",
+                f"${cur_rev:,.0f}"
+            ],
+            y=[prev_rev, price_eff, volume_eff, mix_eff, cur_rev],
+            connector={"line": {"color":"#2E2E2E"}},
+            increasing={"marker":{"color": COLOR["green"]}},
+            decreasing={"marker":{"color": COLOR["red"]}},
+            totals={"marker":{"color": COLOR["blue"]}}
+        ))
+        fig.update_layout(
+            title="Revenue Bridge (P–V–M)",
+            showlegend=False,
+            margin=dict(l=20, r=20, t=40, b=20),
+            yaxis_title="Revenue"
+        )
+        return fig
+
     eff = pvm_effects(df)
     if eff is not None:
         prev_rev, price_eff, volume_eff, mix_eff, cur_rev, total_delta = eff
@@ -721,6 +792,7 @@ if view == "secondary":
             tooltip=["segment_code", "category_code", alt.Tooltip("gm_pct:Q", format=".1%"), alt.Tooltip("revenue:Q", format="$.2s")]
         ).properties(height=360)
         st.altair_chart(chart, use_container_width=True)
+        download_df(seg_cat, "Segment x Category", "segment_category.csv")
 
     # SKU × Region matrix
     if "region_code" in df.columns:
@@ -741,6 +813,7 @@ if view == "secondary":
             tooltip=["product_id","region_code", alt.Tooltip("gm_pct:Q", format=".1%"), alt.Tooltip("disc_load:Q", format=".1%"), alt.Tooltip("revenue:Q", format="$.2s")]
         ).properties(height=400)
         st.altair_chart(chart, use_container_width=True)
+        download_df(mat, "SKU x Region", "sku_region.csv")
 
     # Price band vs policy
     if any(c in df.columns for c in ["list_price","target_price","floor_price"]):
@@ -757,8 +830,10 @@ if view == "secondary":
         if "list_price" in pol.columns:
             mask = pol["realized_price"] < pol["list_price"]
             rows.append({"Violation": "Below List", "Rows": int(mask.sum()), "Share": f"{(mask.sum()/len(pol)):.1%}"})
-        if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        pol_summary = pd.DataFrame(rows)
+        if not pol_summary.empty:
+            st.dataframe(pol_summary, use_container_width=True)
+            download_df(pol_summary, "Policy Violations", "policy_violations.csv")
         chart = alt.Chart(pol).mark_bar().encode(
             x=alt.X("realized_price:Q", bin=alt.Bin(maxbins=30), title="Realized Price"),
             y=alt.Y("count():Q"),
@@ -781,6 +856,7 @@ if view == "secondary":
             ).properties(height=300),
             use_container_width=True
         )
+        download_df(cust, "Customer GM% Distribution", "customer_gm_dist.csv")
 
     # Contribution waterfall by tier/segment
     tier_dim = "tier_code" if "tier_code" in df.columns else ("segment_code" if "segment_code" in df.columns else None)
@@ -799,8 +875,9 @@ if view == "secondary":
         ))
         fig.update_layout(height=320, title=f"Gross Margin Contribution by {tier_dim}")
         st.plotly_chart(fig, use_container_width=True)
+        download_df(contr, f"Contribution by {tier_dim}", "contribution_by_segment.csv")
 
-    # Revenue vs GM% scatter — Customer × Product × Sales Rep
+    # Revenue vs GM% scatter — Customer × Product × Sales Rep (with guards)
     dims = [d for d in ["customer_id","product_id","sales_rep_id"] if d in df.columns]
     if len(dims) == 3:
         st.markdown("**Revenue vs GM% — Customer × Product × Sales Rep**")
@@ -810,7 +887,9 @@ if view == "secondary":
             qty=("quantity","sum")
         )
         grp["gm_pct"] = np.where(grp["revenue"] != 0, (grp["revenue"] - grp["cogs"]) / grp["revenue"], np.nan)
-        topn = st.slider("Limit points by top revenue groups", min_value=50, max_value=5000, value=min(500, len(grp)), step=50)
+        min_rev = st.slider("Minimum revenue to display", min_value=0.0, max_value=float(grp["revenue"].max() or 0), value=0.0, step=max(100.0, float((grp["revenue"].max() or 0)/100)))
+        grp = grp[grp["revenue"] >= min_rev]
+        topn = st.slider("Limit points (by top revenue)", min_value=50, max_value=int(max(100, len(grp))), value=min(500, len(grp)), step=50)
         grp = grp.sort_values("revenue", ascending=False).head(topn)
         scatter = alt.Chart(grp).mark_circle(size=80, opacity=0.6).encode(
             x=alt.X("revenue:Q", title="Revenue", scale=alt.Scale(type="log", nice=False, zero=False)),
@@ -825,6 +904,7 @@ if view == "secondary":
             ]
         ).properties(height=380)
         st.altair_chart(scatter, use_container_width=True)
+        download_df(grp, "Revenue vs GM% (triplet)", "revenue_gmpct_scatter.csv")
     else:
         st.info("Scatter needs customer_id, product_id, and sales_rep_id to be present.")
 
@@ -857,7 +937,6 @@ Apply the deltas/cap, recompute revenue/COGS/freight, and bridge **Baseline → 
     )
 
     scenario = df.copy()
-
     pre_disc_val = scenario["quantity"] * scenario["unit_price"]
     current_discounts = scenario.get("discount", 0).fillna(0) + scenario.get("rebate", 0).fillna(0)
     cap_amount = (discount_cap / 100.0) * pre_disc_val
@@ -869,17 +948,18 @@ Apply the deltas/cap, recompute revenue/COGS/freight, and bridge **Baseline → 
 
     scenario_rev = scenario["quantity"] * scenario_unit_price - capped_discounts
     scenario_cogs = scenario["quantity"] * scenario_unit_cost
-    scenario_gm = scenario_rev - scenario_cogs - scenario_freight
+    scenario_gp_line = scenario_rev - scenario_cogs - scenario_freight
 
     base_rev = float(df["extended_price"].sum())
     base_cogs = float((df["cogs"] if "cogs" in df.columns else df["unit_cost"] * df["quantity"]).sum())
     base_freight = float(df.get("freight", pd.Series([0]*len(df))).sum())
-    base_gm = base_rev - base_cogs - base_freight
+    base_gp_line = (df["extended_price"] - (df["unit_cost"]*df["quantity"]) - df.get("freight", 0).fillna(0))
 
+    base_gm = float(base_gp_line.sum())
     sc_rev = float(scenario_rev.sum())
     sc_cogs = float(scenario_cogs.sum())
     sc_freight = float(scenario_freight.sum())
-    sc_gm = float(scenario_gm.sum())
+    sc_gm = float(scenario_gp_line.sum())
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Revenue (Baseline)", f"${base_rev:,.0f}")
@@ -887,7 +967,7 @@ Apply the deltas/cap, recompute revenue/COGS/freight, and bridge **Baseline → 
     m3.metric("Gross Margin (Baseline)", f"${base_gm:,.0f}")
     m4.metric("Gross Margin (Scenario)", f"${sc_gm:,.0f}", delta=f"${(sc_gm - base_gm):,.0f}")
 
-    # Scenario Bridge
+    # Scenario Bridge (Price → Cost → Discount Cap → Freight)
     qty = scenario["quantity"]
     base_price = df["unit_price"]
     base_cost = df["unit_cost"]
@@ -896,11 +976,11 @@ Apply the deltas/cap, recompute revenue/COGS/freight, and bridge **Baseline → 
     base_rev_line = base_pre_disc - base_disc
     base_cogs_line = qty * base_cost
     base_freight_line = df.get("freight", 0).fillna(0)
-    base_gp_line = base_rev_line - base_cogs_line - base_freight_line
+    base_gp_line_seq = base_rev_line - base_cogs_line - base_freight_line
 
     price_rev_line = qty * scenario_unit_price - base_disc
     price_gp_line = price_rev_line - base_cogs_line - base_freight_line
-    price_eff = float(price_gp_line.sum() - base_gp_line.sum())
+    price_eff = float(price_gp_line.sum() - base_gp_line_seq.sum())
 
     cost_cogs_line = qty * scenario_unit_cost
     cost_gp_line = price_rev_line - cost_cogs_line - base_freight_line
@@ -911,15 +991,15 @@ Apply the deltas/cap, recompute revenue/COGS/freight, and bridge **Baseline → 
     cap_eff = float(cap_gp_line.sum() - cost_gp_line.sum())
 
     freight_line = scenario_freight
-    scen_gp_line = cap_rev_line - cost_cogs_line - freight_line
-    freight_eff = float(scen_gp_line.sum() - cap_gp_line.sum())
+    scen_gp_line_final = cap_rev_line - cost_cogs_line - freight_line
+    freight_eff = float(scen_gp_line_final.sum() - cap_gp_line.sum())
 
     fig = go.Figure(go.Waterfall(
         name="Scenario Bridge",
         orientation="v",
         measure=["absolute","relative","relative","relative","relative","total"],
         x=["Baseline GM", "Price Δ", "Cost Δ", "Discount Cap Δ", "Freight Δ", "Scenario GM"],
-        y=[float(base_gp_line.sum()), price_eff, cost_eff, cap_eff, freight_eff, float(scen_gp_line.sum())],
+        y=[float(base_gp_line_seq.sum()), price_eff, cost_eff, cap_eff, freight_eff, float(scen_gp_line_final.sum())],
         increasing={"marker":{"color": COLOR["green"]}},
         decreasing={"marker":{"color": COLOR["red"]}},
         totals={"marker":{"color": COLOR["blue"]}},
@@ -927,10 +1007,23 @@ Apply the deltas/cap, recompute revenue/COGS/freight, and bridge **Baseline → 
     ))
     fig.update_layout(title="Scenario Bridge — Baseline → Scenario", height=360)
     st.plotly_chart(fig, use_container_width=True)
-    st.caption("Order of effects is illustrative. Validate in BI before any action. Not financial advice.")
+    st.caption("Assumes no volume elasticity; order of effects is illustrative. Not financial advice.")
+
+    # Scenario impact by segment (if available)
+    if "segment_code" in df.columns:
+        st.markdown("**Scenario Impact by Segment (Δ GM $)**")
+        seg_view = pd.DataFrame({
+            "segment_code": df["segment_code"],
+            "base_gp": base_gp_line,
+            "sc_gp": scenario_gp_line
+        })
+        seg_view["delta_gp"] = seg_view["sc_gp"] - seg_view["base_gp"]
+        seg_view = seg_view.groupby("segment_code", as_index=False)["delta_gp"].sum().sort_values("delta_gp", ascending=False)
+        st.dataframe(seg_view, use_container_width=True)
+        download_df(seg_view, "Scenario Impact by Segment", "scenario_impact_segment.csv")
 
 # =========================
-# Assumptions & Formulas
+# Assumptions & Formulas + Build stamp
 # =========================
 st.subheader("Assumptions & Formulas")
 st.markdown(
@@ -949,3 +1042,5 @@ st.markdown(
 - `discount+rebate % = (discount + rebate) / (extended_price + discount + rebate)`
 """
 )
+
+st.caption(f"Build: {datetime.now().strftime('%Y-%m-%d %H:%M')} • Phase 1 Diagnostic • No external benchmarks")
