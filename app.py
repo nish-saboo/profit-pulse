@@ -261,7 +261,7 @@ def aggregate_in_chunks(file):
         return agg
     return pd.DataFrame()
 
-def derive_missing_price_cost(df: pd.DataFrame, issues: list) -> pdDataFrame:
+def derive_missing_price_cost(df: pd.DataFrame, issues: list) -> pd.DataFrame:
     if "unit_price" not in df.columns and "quantity" in df.columns:
         for col in TOTAL_REVENUE_COLS:
             if col in df.columns:
